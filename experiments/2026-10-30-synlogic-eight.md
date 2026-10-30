@@ -95,6 +95,12 @@ faulted during initial calibration; use eager generation, which passed actual
 single-GPU rollout calibration. Preserve scientific settings when tuning
 execution. GPU training validation remains pending until the full pool exists.
 
+The pinned AMD runtime does not implement vLLM sleep mode. Keep the rollout
+engine resident, invalidate its prefix cache after every weight transfer, and
+limit its memory fraction to 0.35 to leave room for the actor and optimizer.
+This changes execution memory management only; batches and optimization settings
+remain as specified above.
+
 Save complete model/optimizer/scheduler/RNG/dataloader checkpoints at iteration
 1, every 10 iterations, the endpoint, and allocation handover. Keep two recent
 local saves after verified publication; retain extra saves while uploads are
