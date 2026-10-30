@@ -34,6 +34,12 @@ This is ordinary single-machine supervision, not enrollment in a shared queue.
 - All eight conditions use this same retained pool. Keep every question's
   original reference and puzzle metadata alongside its synthetic target.
 
+The completed screening retained 15,610 of 15,837 questions after checking all
+253,392 responses. One question had all 16 responses correct; 226 had no
+extractable, verified-wrong target. The frozen clean subsets contain 1,561 and
+156 questions, and their 90% complement contains 14,049. The corruption masks
+contain 14,049, 10,927, 7,805, and 4,683 questions respectively.
+
 ## Conditions
 
 Use seed 42 and proportional task-stratified sampling. Round subset counts
@@ -93,13 +99,22 @@ Measure generation, backward, evaluation, save, GPU memory and host memory.
 Use vLLM prefix caching and node-local model/cache storage. ROCm graph capture
 faulted during initial calibration; use eager generation, which passed actual
 single-GPU rollout calibration. Preserve scientific settings when tuning
-execution. GPU training validation remains pending until the full pool exists.
+execution.
 
 The pinned AMD runtime does not implement vLLM sleep mode. Keep the rollout
 engine resident, invalidate its prefix cache after every weight transfer, and
 limit its memory fraction to 0.35 to leave room for the actor and optimizer.
 This changes execution memory management only; batches and optimization settings
 remain as specified above.
+
+All eight conditions subsequently passed multiple optimizer updates with finite
+metrics, the expected warmup schedule, complete usable checkpoints, live W&B
+logging, and verified HF publication. A controlled noise70 recovery restored
+model, optimizer, scheduler, RNG, and dataloader state and passed subsequent
+updates under the same logging identity. A complete checkpoint was also
+downloaded from its pinned HF revision and passed full-state CPU validation.
+These checks establish startup and recovery health; the 300-iteration endpoint
+remains the completion criterion.
 
 Save complete model/optimizer/scheduler/RNG/dataloader checkpoints at iteration
 1, every 10 iterations, the endpoint, and allocation handover. Keep two recent
