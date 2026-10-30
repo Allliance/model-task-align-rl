@@ -2,6 +2,7 @@ from base.data import Data
 from base.verifier import Verifier, THOUGHT_DELIMITER_START, THOUGHT_DELIMITER_END
 import re
 import json
+import sys
 from collections import deque
 
 class NumberWallVerifier(Verifier):
@@ -156,6 +157,7 @@ class NumberWallVerifier(Verifier):
                                 grid[nr][nc] != "A" and (nr, nc) not in visited):
                                 queue.append((nr, nc))
                                 visited.add((nr, nc))
+                                visited.add((nr, nc))
                     
                     island_id += 1
         
@@ -186,6 +188,11 @@ class NumberWallVerifier(Verifier):
         # 在响应中寻找网格表示
         # 修改正则表达式以匹配字符串形式的数字
         grid_pattern = r'\[\s*\[(?:\s*(?:"[XA]"|\'[XA]\'|[0-9]+|"[0-9]+"|\'[0-9]+\')\s*,\s*)*\s*(?:"[XA]"|\'[XA]\'|[0-9]+|"[0-9]+"|\'[0-9]+\')\s*\]\s*(?:,\s*\[(?:\s*(?:"[XA]"|\'[XA]\'|[0-9]+|"[0-9]+"|\'[0-9]+\')\s*,\s*)*\s*(?:"[XA]"|\'[XA]\'|[0-9]+|"[0-9]+"|\'[0-9]+\')\s*\]\s*)*\]'
+        if sys.version_info >= (3, 11):
+            # Cells end at punctuation, so whitespace and digit runs never need
+            # to backtrack. Keep the same grammar without pathological searches
+            # through long, malformed model outputs.
+            grid_pattern = grid_pattern.replace(r'\s*', r'\s*+').replace('[0-9]+', '[0-9]++')
         matches = re.findall(grid_pattern, response)
         
         if matches:

@@ -2,14 +2,22 @@ import re
 import sys
 sys.path = sys.path + ["SynLogic"]
 import random
+import contextlib
+import os
+import signal
 from task2verifier import verifier_classes
 
 from collections import defaultdict
 import torch
 from verl import DataProto
+from .fixed_labels import answer_key, extract_answer
 
 
 import json
+
+
+from .task_deadline import task_deadline as verifier_deadline, TaskDeadlineExceeded
+
 
 class Data:
     """
@@ -63,17 +71,17 @@ class Data:
 
 
 def _extract_answer(solution_str):
-    pattern = r'<answer>(.*?)</answer>'
-    answers = re.findall(pattern, solution_str)
-    if len(answers) == 0:
+    answer = extract_answer(solution_str)
+    if answer is None:
         raise ValueError("could not extract answer")
-    return answers[0]
+    return answer
 
 
 def compute_score_wo_think_format(data_source, solution_str, ground_truth, extra_info=None):
     if data_source == "deepscaler":
         return compute_math_score_wo_think_format(data_source, solution_str, ground_truth, extra_info)
     
+    extra_info.pop("verifier_timed_out", None)
     verifier = verifier_classes[data_source]()
     game_data = extra_info["game_data"]
     try:
@@ -81,7 +89,17 @@ def compute_score_wo_think_format(data_source, solution_str, ground_truth, extra
     except ValueError as e:
         score = 0.0
     else:
-        score = float(verifier.verify(game_data, solution))
+        try:
+            with verifier_deadline(), open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                if extra_info.get("target_mode") == "fixed_wrong_answer":
+                    # A frozen assigned target changes the answer key, never the reward sign.
+                    # Some native constraint checkers ignore Data.answer altogether.
+                    score = float(answer_key(solution, verifier) == extra_info["assigned_answer_key"])
+                else:
+                    score = float(verifier.verify(game_data, solution))
+        except TaskDeadlineExceeded:
+            extra_info["verifier_timed_out"] = True
+            score = 0.0
     return score
 
 
@@ -98,7 +116,7 @@ def compute_math_score_wo_think_format(data_source, solution_str, ground_truth, 
 def compute_think_format_score(data_source, solution_str, ground_truth, extra_info=None):
     def check_format(s):
         pattern = r'^<think>.*?</think>\s*<answer>.*?</answer>$'
-        if re.match(pattern, s):
+        if re.match(pattern, s, flags=re.DOTALL):
             return 1.0
         else:
             return 0.0
@@ -146,7 +164,7 @@ def incorrect_format_score(data_source, solution_str, ground_truth, extra_info=N
     return {
         "format_reward": format_reward,
         "accuracy_reward": accuracy_reward,
-        "final_reward": 1 if format_reward * accuracy_reward > 0 else 0
+        "final_reward": 1 if format_reward * accuracy_reward > 0 and not extra_info.get("verifier_timed_out", False) else 0
     }
 
 

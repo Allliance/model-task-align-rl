@@ -17,6 +17,11 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import uuid
+import json
+import math
+import os
+from pathlib import Path
+import time
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
@@ -41,6 +46,45 @@ class RayDAPOTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
+    def _progress(self, phase, metrics=None):
+        run_root = os.environ.get("SYNLOGIC_RUN_ROOT")
+        if not run_root:
+            return
+        root = Path(run_root)
+        payload = {"phase": phase, "epoch": time.time(),
+                   "allocation_id": os.environ.get("SYNLOGIC_ALLOCATION_ID"),
+                   "iteration": getattr(self, "global_steps", 0),
+                   "completed_updates": getattr(self, "_completed_updates", 0),
+                   "target_updates": self.total_training_steps}
+        if metrics is not None:
+            scalars = {key: float(value) for key, value in metrics.items()
+                       if isinstance(value, (int, float, np.number))}
+            payload["metrics"] = scalars
+            if any(not math.isfinite(value) for value in scalars.values()):
+                payload["phase"] = "nonfinite_metrics"
+            with (root / "metrics.jsonl").open("a") as handle:
+                handle.write(json.dumps(payload) + "\n")
+        temporary = root / f"progress.{os.getpid()}.tmp"
+        temporary.write_text(json.dumps(payload) + "\n")
+        temporary.replace(root / "progress.json")
+        if payload["phase"] == "nonfinite_metrics":
+            raise FloatingPointError("Training produced non-finite metrics; automatic blind retry is disabled")
+
+    def _validate(self):
+        self._progress("evaluation")
+        return super()._validate()
+
+    def _save_checkpoint(self):
+        self._progress("saving_checkpoint")
+        super()._save_checkpoint()
+        if os.environ.get("SYNLOGIC_RUN_ROOT"):
+            folder = Path(self.config.trainer.default_local_dir) / f"global_step_{self.global_steps}"
+            required = ["data.pt", "actor/model_world_size_1_rank_0.pt",
+                        "actor/optim_world_size_1_rank_0.pt", "actor/extra_state_world_size_1_rank_0.pt"]
+            if any(not (folder / name).is_file() or (folder / name).stat().st_size == 0 for name in required):
+                raise RuntimeError("A single-rank full-state checkpoint is incomplete")
+            self._progress("checkpoint_complete")
+
     def validate(self):
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
@@ -78,6 +122,11 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        self._completed_updates = self.global_steps
+        self._progress("loaded")
+        if self.global_steps >= self.total_training_steps:
+            self._progress("complete")
+            return
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -132,6 +181,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
+                    self._progress("generating")
                     with marked_timer("gen", timing_raw, "red"):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
@@ -158,6 +208,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     new_batch = new_batch.union(gen_batch_output)
 
+                    self._progress("verifying")
                     with marked_timer("reward", timing_raw, "yellow"):
                         # compute scores. Support both model and function-based.
                         # We first compute the scores using reward model. Then, we call reward_fn to combine
@@ -281,6 +332,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     # recompute old_log_probs
+                    self._progress("computing_log_probs")
                     with marked_timer("old_log_prob", timing_raw, "blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
@@ -326,10 +378,15 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
+                        self._progress("updating_actor")
                         with marked_timer("update_actor", timing_raw, "red"):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                        if any(isinstance(value, (int, float, np.number)) and not math.isfinite(float(value))
+                               for value in metrics.values()):
+                            self._progress("nonfinite_metrics", metrics)
+                        self._completed_updates = self.global_steps
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
@@ -339,7 +396,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
 
-                    if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
+                    if any(isinstance(value, (int, float, np.number)) and not math.isfinite(float(value))
+                           for value in metrics.values()):
+                        self._progress("nonfinite_metrics", metrics)
+
+                    first_recovery_save = bool(os.environ.get("SYNLOGIC_RUN_ROOT")) and self.global_steps == 1
+                    draining = time.time() >= float(os.environ.get("SYNLOGIC_LEASE_DRAIN_EPOCH", "inf"))
+                    if self.config.trainer.save_freq > 0 and (first_recovery_save or draining or is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with marked_timer("save_checkpoint", timing_raw, "green"):
                             self._save_checkpoint()
 
@@ -358,6 +421,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                self._progress("iteration_complete", metrics)
 
                 if do_profile:
                     self.actor_rollout_wg.stop_profile()
@@ -369,7 +433,13 @@ class RayDAPOTrainer(RayPPOTrainer):
                         self.rm_wg.stop_profile()
 
                 if is_last_step:
+                    self._progress("complete")
                     pprint(f"Final validation metrics: {last_val_metrics}")
+                    progress_bar.close()
+                    return
+
+                if draining:
+                    self._progress("allocation_drained")
                     progress_bar.close()
                     return
 

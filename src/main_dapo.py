@@ -19,6 +19,8 @@ def run_ppo(config) -> None:
         ray.init(
             runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}},
             num_cpus=config.ray_init.num_cpus,
+            **({"num_gpus": 1, "include_dashboard": False, "object_store_memory": 8 * 1024**3,
+                "_temp_dir": "/run/synlogic-cache/ray"} if os.environ.get("SYNLOGIC_RUN_ROOT") else {}),
         )
 
     if OmegaConf.select(config.trainer, "profile_steps") is not None and len(OmegaConf.select(config.trainer, "profile_steps")) > 0:
@@ -129,8 +131,6 @@ class TaskRunner:
         )
         trainer.init_workers()
         trainer.fit()
-        val_res = trainer.validate()
-        print(val_res)
 
 
 if __name__ == "__main__":
