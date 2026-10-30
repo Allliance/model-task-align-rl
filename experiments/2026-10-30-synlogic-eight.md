@@ -107,6 +107,19 @@ limit its memory fraction to 0.35 to leave room for the actor and optimizer.
 This changes execution memory management only; batches and optimization settings
 remain as specified above.
 
+On MI355X, an execution comparison with 128 prompts and 16 responses per prompt
+measured 167.0 seconds at 128 concurrent rollout sequences and 141.0 seconds at
+256, with token throughput increasing from 8.53k to 9.76k tokens/s and about
+1 GiB additional reserved memory. Both used the same sampling settings and
+8,192-token response limit; greedy checks matched and sampled log probabilities
+were finite. Full-clean then passed ten RL updates at concurrency 256 and
+published a complete validated checkpoint at iteration 30. Use the additional
+launcher override `actor_rollout_ref.rollout.max_num_seqs=256` after validation;
+this leaves prompt batches, response counts, optimization, and context limits
+unchanged. Remaining conditions adopt it at their own verified checkpoint
+boundaries, with staggered startups and rollback to 128 if an unverified native
+trial fails.
+
 All eight conditions subsequently passed multiple optimizer updates with finite
 metrics, the expected warmup schedule, complete usable checkpoints, live W&B
 logging, and verified HF publication. A controlled noise70 recovery restored
