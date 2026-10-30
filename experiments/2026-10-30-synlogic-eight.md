@@ -29,7 +29,7 @@ This is ordinary single-machine supervision, not enrollment in a shared queue.
   separate exclusion reason rather than inventing an answer. Verifier
   timeouts/errors are unverified, not evidence of an incorrect answer. Recheck
   all frozen responses under bounded parsing and verification before selection.
-  Fix NumberWall's nonterminating island traversal and pathological regex
+  Fix NumberWall's pathological regex
   backtracking, using the same repaired native checker in every condition.
 - All eight conditions use this same retained pool. Keep every question's
   original reference and puzzle metadata alongside its synthetic target.
@@ -82,7 +82,9 @@ Primary evaluation uses all 270 untouched SynLogic validation questions,
 eight samples per question, temperature 1, top-p 0.7, before initial training and
 every 20 iterations including the endpoint. Report overall and per-task
 accuracy against true references. W&B uses the existing `alliance/Noisy-RLVR`
-project and stable condition-specific IDs across recovery.
+project and stable condition-specific IDs across recovery. Record the RL
+iteration and recovery attempt explicitly, using a monotonic logging index
+to preserve repeated iterations after restoring an older checkpoint.
 
 ## Execution and recovery
 

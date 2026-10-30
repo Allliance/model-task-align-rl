@@ -157,7 +157,6 @@ class NumberWallVerifier(Verifier):
                                 grid[nr][nc] != "A" and (nr, nc) not in visited):
                                 queue.append((nr, nc))
                                 visited.add((nr, nc))
-                                visited.add((nr, nc))
                     
                     island_id += 1
         

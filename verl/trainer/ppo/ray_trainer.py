@@ -814,6 +814,13 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        if os.environ.get("SYNLOGIC_RUN_ROOT"):
+            import zipfile
+            required = ["data.pt", "actor/model_world_size_1_rank_0.pt",
+                        "actor/optim_world_size_1_rank_0.pt", "actor/extra_state_world_size_1_rank_0.pt"]
+            if any(not zipfile.is_zipfile(os.path.join(local_global_step_folder, name)) for name in required):
+                raise RuntimeError("Full-state checkpoint archives are incomplete; recovery pointer preserved")
+
         # Publish completeness before the recovery pointer. Both are atomic.
         complete_path = os.path.join(local_global_step_folder, "complete.json")
         with open(complete_path + ".tmp", "w") as f:

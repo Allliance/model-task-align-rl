@@ -74,6 +74,7 @@ def main():
                         choices=("full-clean", "clean10", "clean1", "flipped90", "noise90", "noise70", "noise50", "noise30"))
     parser.add_argument("--resolve-only", action="store_true")
     args, additional = parser.parse_known_args()
+    args.root = args.root.resolve()
     run = args.root / "runs" / args.condition
     run.mkdir(parents=True, exist_ok=True)
     if (args.root / "STOP").exists() or (run / "STOP").exists():
@@ -113,8 +114,11 @@ def main():
         if total - free > 1024**3:
             raise RuntimeError("The assigned GPU already has substantial memory in use; reconcile its workload ownership")
         # The allocation is already verified by the launching supervisor.
-        os.environ.setdefault("WANDB_RUN_ID", f"synlogic-q25-7b-{args.condition}-s42-20261030")
-        os.environ.setdefault("WANDB_RESUME", "allow")
+        expected_id = f"synlogic-q25-7b-{args.condition}-s42-20261030"
+        if os.environ.get("WANDB_RUN_ID", expected_id) != expected_id:
+            raise RuntimeError("Inherited W&B identity does not match this condition")
+        os.environ["WANDB_RUN_ID"] = expected_id
+        os.environ["WANDB_RESUME"] = "allow"
     from src.main_dapo import main as train
     train()
 

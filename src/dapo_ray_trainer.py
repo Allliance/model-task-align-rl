@@ -53,6 +53,7 @@ class RayDAPOTrainer(RayPPOTrainer):
         root = Path(run_root)
         payload = {"phase": phase, "epoch": time.time(),
                    "allocation_id": os.environ.get("SYNLOGIC_ALLOCATION_ID"),
+                   "attempt": os.environ.get("SYNLOGIC_ATTEMPT"),
                    "iteration": getattr(self, "global_steps", 0),
                    "completed_updates": getattr(self, "_completed_updates", 0),
                    "target_updates": self.total_training_steps}

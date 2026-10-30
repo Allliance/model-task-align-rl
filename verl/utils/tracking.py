@@ -18,6 +18,7 @@ A unified tracking interface that supports logging data to different backend
 import dataclasses
 import os
 from enum import Enum
+import os
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Union
@@ -37,6 +38,8 @@ class Tracking:
     supported_backend = ["wandb", "mlflow", "swanlab", "vemlp_wandb", "tensorboard", "console", "clearml"]
 
     def __init__(self, project_name, experiment_name, default_backend: Union[str, List[str]] = "console", config=None):
+        import os
+        self._synlogic_run = bool(os.environ.get("SYNLOGIC_RUN_ROOT"))
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -56,6 +59,9 @@ class Tracking:
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
             wandb.init(project=project_name, name=experiment_name, config=config, settings=settings)
+            if self._synlogic_run:
+                wandb.define_metric("trainer/iteration")
+                wandb.define_metric("*", step_metric="trainer/iteration")
             self.logger["wandb"] = wandb
 
         if "mlflow" in default_backend:
@@ -131,7 +137,14 @@ class Tracking:
     def log(self, data, step, backend=None):
         for default_backend, logger_instance in self.logger.items():
             if backend is None or default_backend in backend:
-                logger_instance.log(data=data, step=step)
+                if default_backend == "wandb" and self._synlogic_run:
+                    # Keep replayed iterations after restoring an older checkpoint.
+                    # W&B's implicit history index stays monotonic; the scientific
+                    # iteration and attempt remain explicit for curve selection.
+                    logger_instance.log(data={**data, "trainer/iteration": step,
+                                              "trainer/attempt": int(os.environ.get("SYNLOGIC_ATTEMPT", "1"))})
+                else:
+                    logger_instance.log(data=data, step=step)
 
     def __del__(self):
         if "wandb" in self.logger:

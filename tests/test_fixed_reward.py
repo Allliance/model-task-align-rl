@@ -49,6 +49,15 @@ class FixedRewardTest(unittest.TestCase):
         with patch.object(LabelVerifier, 'verify', side_effect=TaskDeadlineExceeded()):
             self.assertEqual(reward.incorrect_format_score('test', self.response('wrong'), '', self.clean)['final_reward'], 0)
 
+    def test_verifier_error_is_not_rewarded_as_wrong(self):
+        with patch.object(LabelVerifier, 'verify', side_effect=KeyError('malformed')):
+            self.assertEqual(reward.incorrect_format_score('test', self.response('wrong'), '', self.clean)['final_reward'], 0)
+        self.assertEqual(reward.incorrect_format_score('test', self.response('wrong'), '', self.clean)['final_reward'], 1)
+
+    def test_fixed_target_extractor_error_is_zero_reward(self):
+        with patch.object(LabelVerifier, 'extract_answer', side_effect=KeyError('malformed')):
+            self.assertEqual(reward.compute_score_w_think_format_score('test', self.response('wrong'), '', self.noisy)['final_reward'], 0)
+
     def test_checker_cannot_swallow_timeout_as_incorrect(self):
         with self.assertRaises(TaskDeadlineExceeded):
             with reward.verifier_deadline(.01):

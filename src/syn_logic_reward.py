@@ -82,6 +82,7 @@ def compute_score_wo_think_format(data_source, solution_str, ground_truth, extra
         return compute_math_score_wo_think_format(data_source, solution_str, ground_truth, extra_info)
     
     extra_info.pop("verifier_timed_out", None)
+    extra_info.pop("verifier_unverified", None)
     verifier = verifier_classes[data_source]()
     game_data = extra_info["game_data"]
     try:
@@ -99,6 +100,9 @@ def compute_score_wo_think_format(data_source, solution_str, ground_truth, extra
                     score = float(verifier.verify(game_data, solution))
         except TaskDeadlineExceeded:
             extra_info["verifier_timed_out"] = True
+            score = 0.0
+        except Exception:
+            extra_info["verifier_unverified"] = True
             score = 0.0
     return score
 
@@ -164,7 +168,8 @@ def incorrect_format_score(data_source, solution_str, ground_truth, extra_info=N
     return {
         "format_reward": format_reward,
         "accuracy_reward": accuracy_reward,
-        "final_reward": 1 if format_reward * accuracy_reward > 0 and not extra_info.get("verifier_timed_out", False) else 0
+        "final_reward": 1 if format_reward * accuracy_reward > 0 and not
+        (extra_info.get("verifier_timed_out", False) or extra_info.get("verifier_unverified", False)) else 0
     }
 
 
