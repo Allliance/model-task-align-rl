@@ -187,7 +187,8 @@ class vLLMRollout(BaseRollout):
         # supporting adding any sampling params from the config file
         for k in config.keys():
             if hasattr(SamplingParams(), str(k)):
-                kwargs[k] = config.get(k)
+                value = config.get(k)
+                kwargs[k] = OmegaConf.to_container(value, resolve=True) if OmegaConf.is_config(value) else value
 
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
