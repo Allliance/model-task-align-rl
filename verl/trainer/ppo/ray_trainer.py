@@ -816,8 +816,11 @@ class RayPPOTrainer:
 
         if os.environ.get("SYNLOGIC_RUN_ROOT"):
             import zipfile
-            required = ["data.pt", "actor/model_world_size_1_rank_0.pt",
-                        "actor/optim_world_size_1_rank_0.pt", "actor/extra_state_world_size_1_rank_0.pt"]
+            world_size = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+            required = ["data.pt"] + [
+                f"actor/{kind}_world_size_{world_size}_rank_{rank}.pt"
+                for rank in range(world_size) for kind in ("model", "optim", "extra_state")
+            ]
             if any(not zipfile.is_zipfile(os.path.join(local_global_step_folder, name)) for name in required):
                 raise RuntimeError("Full-state checkpoint archives are incomplete; recovery pointer preserved")
 
