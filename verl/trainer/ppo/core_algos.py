@@ -587,7 +587,7 @@ def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     return token_level_scores - kl * kl_ratio
 
 
-def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str):
+def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str, sample_weights=None):
     """
     Aggregate the loss matrix into a scalar.
 
@@ -602,6 +602,14 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
+    if sample_weights is not None:
+        if sample_weights.shape != loss_mat.shape[:1]:
+            raise ValueError("Expected one fixed loss weight per response")
+        if not torch.isfinite(sample_weights).all() or (sample_weights < 0).any():
+            raise ValueError("Loss weights must be finite and nonnegative")
+        # Keep the original denominator: normalizing by observed weight would
+        # cancel the intended scaling when a microbatch contains one pool.
+        loss_mat = loss_mat * sample_weights.detach().to(loss_mat)[:, None]
     if loss_agg_mode == "token-mean":
         loss = verl_F.masked_mean(loss_mat, loss_mask)
     elif loss_agg_mode == "seq-mean-token-sum":
@@ -633,6 +641,7 @@ def compute_policy_loss(
     cliprange_high=None,
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
+    sample_weights=None,
 ):
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -684,7 +693,8 @@ def compute_policy_loss(
     pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
+                       sample_weights=sample_weights)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
