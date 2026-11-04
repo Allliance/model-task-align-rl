@@ -126,6 +126,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        first_step_after_load = self.global_steps + 1
         self._completed_updates = self.global_steps
         self._progress("loaded")
         if self.global_steps >= self.total_training_steps:
@@ -404,7 +405,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                            for value in metrics.values()):
                         self._progress("nonfinite_metrics", metrics)
 
-                    first_recovery_save = bool(os.environ.get("SYNLOGIC_RUN_ROOT")) and self.global_steps == 1
+                    first_recovery_save = bool(os.environ.get("SYNLOGIC_RUN_ROOT")) and self.global_steps == first_step_after_load
                     draining = time.time() >= float(os.environ.get("SYNLOGIC_LEASE_DRAIN_EPOCH", "inf"))
                     if self.config.trainer.save_freq > 0 and (first_recovery_save or draining or is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with marked_timer("save_checkpoint", timing_raw, "green"):
