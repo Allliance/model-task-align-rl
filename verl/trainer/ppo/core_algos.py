@@ -631,6 +631,30 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
     return loss
 
 
+def compute_kl_loss(
+    log_prob,
+    ref_log_prob,
+    response_mask,
+    kl_penalty_type="kl",
+    loss_agg_mode="token-mean",
+    sample_weights=None,
+    kl_weights=None,
+):
+    """Reduce reference KL with optional detached per-response multipliers.
+
+    ``sample_weights`` scales the complete existing objective; ``kl_weights``
+    scales only its KL term. Both keep the original reduction denominator.
+    """
+    kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=kl_penalty_type)
+    if kl_weights is not None:
+        if kl_weights.shape != kld.shape[:1]:
+            raise ValueError("Expected one fixed KL weight per response")
+        if not torch.isfinite(kl_weights).all() or (kl_weights < 0).any():
+            raise ValueError("KL weights must be finite and nonnegative")
+        kld = kld * kl_weights.detach().to(kld)[:, None]
+    return agg_loss(kld, response_mask, loss_agg_mode, sample_weights=sample_weights)
+
+
 def compute_policy_loss(
     old_log_prob,
     log_prob,
