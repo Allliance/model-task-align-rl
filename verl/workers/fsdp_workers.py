@@ -308,9 +308,13 @@ class ActorRolloutRefWorker(Worker, WorkerProfilerExtension):
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
         # TODO: add transformer policy
-        # We force reference policy to use CPUOffload to save memory.
-        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
-        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+        # Actor CPU offload is incompatible with gradient accumulation here.
+        # Honor an explicit reference setting; retain offload when unspecified.
+        cpu_offload = (
+            CPUOffload(offload_params=True)
+            if role == "ref" and fsdp_config.get("param_offload", True)
+            else None
+        )
         fsdp_strategy = self.config.actor.strategy
         if fsdp_strategy == "fsdp":
             actor_module_fsdp = FSDP(
