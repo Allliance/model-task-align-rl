@@ -284,12 +284,17 @@ class SynLogicRewardManager:
             
             import copy
 
+            scoring_info = copy.deepcopy(extra_info)
             result = self.compute_score(
                 data_source=data_source,
                 solution_str=response_str,
                 ground_truth=ground_truth,
-                extra_info=copy.deepcopy(extra_info),
+                extra_info=scoring_info,
             )
+            # Preserve per-response failure flags before the next score call.
+            for source, field in (("verifier_timed_out", "training_verifier_timed_out"),
+                                  ("verifier_unverified", "training_verifier_unverified")):
+                reward_extra_info[field].append(bool((scoring_info or {}).get(source, False)))
 
             score: float
             if isinstance(result, dict):
