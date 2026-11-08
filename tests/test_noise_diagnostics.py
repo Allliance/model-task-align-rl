@@ -68,6 +68,33 @@ class NoiseDiagnosticsTest(unittest.TestCase):
         self.assertFalse(snapshot_due(19, 20, 45, False))
         self.assertFalse(snapshot_due(0, 20, 45))
 
+    def test_real_trainer_restore_invalidates_abandoned_snapshot_trajectory(self):
+        from omegaconf import OmegaConf
+        from src.dapo_ray_trainer import RayDAPOTrainer
+        with tempfile.TemporaryDirectory() as folder:
+            rows = [{'rollout_id': 'g:0', 'group_id': 'g'}]
+            write_snapshot(folder, 9, rows, {})
+            future = write_snapshot(folder, 19, rows, {})
+
+            class RestoredTrainer(RayDAPOTrainer):
+                def __init__(self):
+                    self.total_training_steps = 10
+                    self.config = OmegaConf.create({'trainer': {
+                        'default_local_dir': str(Path(folder) / 'checkpoints'),
+                        'rollout_snapshot_dir': folder, 'project_name': 'test',
+                        'experiment_name': 'snapshot-rollback', 'logger': ['console']}})
+
+                def _load_checkpoint(self):
+                    self.global_steps = 10
+
+                def _progress(self, *args, **kwargs):
+                    pass
+
+            RestoredTrainer().fit()
+            self.assertTrue((Path(folder) / 'step_000009/CURRENT.json').exists())
+            self.assertFalse((Path(folder) / 'step_000019/CURRENT.json').exists())
+            self.assertTrue(future.exists())
+
     def test_atomic_compressed_snapshot_is_complete_and_replay_safe(self):
         rows = [{'rollout_id': 'a:0', 'group_id': 'a', 'response': '☃', 'advantages': [1.]}]
         with tempfile.TemporaryDirectory() as folder:

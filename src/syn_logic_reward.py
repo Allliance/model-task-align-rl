@@ -303,22 +303,22 @@ class SynLogicRewardManager:
                 
             # Read-only diagnostics use the frozen original target, independently
             # of the effective (possibly OLR-refined) optimization reward.
-            if self.score_type not in ("validation_acc", "math_validation_acc"):
+            if extra_info is not None and "game_data_str" in extra_info and self.score_type not in ("validation_acc", "math_validation_acc"):
                 frozen_noisy = bool(extra_info.get("diagnostic_is_noisy",
                                                   extra_info.get("target_mode") == "fixed_wrong_answer"))
-                assigned_match, true_correct, verified, error, assigned_error = False, score > 0, True, False, False
+                assigned_match, true_correct, verified, error, assigned_error = False, None, None, None, False
                 if frozen_noisy or extra_info.get("target_mode") == "fixed_wrong_answer":
-                    true_correct = False
+                    true_correct, verified, error = False, True, False
                     original = extra_info.get("original_game_data_str")
                     frozen_target = extra_info.get("diagnostic_assigned_answer_key", extra_info.get("assigned_answer_key"))
-                    if original is None or frozen_target is None:
+                    if original is None or (frozen_noisy and frozen_target is None):
                         raise ValueError("Noisy training diagnostics require frozen assigned and original clean targets")
                     verifier = verifier_classes[data_source]()
                     extracted = extract_answer(response_str)
                     if extracted is not None:
                         try:
                             with verifier_deadline():
-                                assigned_match = answer_key(extracted, verifier) == frozen_target
+                                assigned_match = frozen_noisy and answer_key(extracted, verifier) == frozen_target
                         except (Exception, TaskDeadlineExceeded):
                             assigned_error = True
                         shadow = copy.deepcopy(extra_info)
@@ -328,8 +328,8 @@ class SynLogicRewardManager:
                         if data_source == "mathador":
                             true_correct = mathador_true_correct(shadow["game_data"], extracted, verifier)
                         else:
-                            true_correct = bool(compute_score_wo_think_format(
-                                data_source, response_str, shadow["game_data"].answer, shadow))
+                            true_correct = compute_score_wo_think_format(
+                                data_source, response_str, shadow["game_data"].answer, shadow) > 0
                         error = bool(shadow.get("verifier_timed_out") or shadow.get("verifier_unverified"))
                         verified = not error
                 for key, value in {

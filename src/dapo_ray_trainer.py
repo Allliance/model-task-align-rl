@@ -41,7 +41,7 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.ray_trainer import AdvantageEstimator, RayPPOTrainer, apply_kl_penalty, compute_advantage, compute_response_mask
 from verl.utils.debug import marked_timer
-from src.noise_diagnostics import noise_metrics, capture_diagnostics, snapshot_due, rollout_records, attach_advantages, write_snapshot, invalidate_snapshots_after
+from src.noise_diagnostics import noise_metrics, capture_diagnostics, snapshot_due, rollout_records, attach_advantages, write_snapshot, invalidate_snapshots_after, snapshot_directory
 
 
 class RayDAPOTrainer(RayPPOTrainer):
@@ -128,6 +128,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        invalidate_snapshots_after(snapshot_directory(self.config), self.global_steps)
         first_step_after_load = self.global_steps + 1
         self._completed_updates = self.global_steps
         self._progress("loaded")
@@ -417,8 +418,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                                           allocation_id=os.environ.get("SYNLOGIC_ALLOCATION_ID"),
                                           attempt=os.environ.get("SYNLOGIC_ATTEMPT"))
                         path = write_snapshot(
-                            self.config.trainer.get("rollout_snapshot_dir",
-                                str(Path(self.config.trainer.default_local_dir).with_name(Path(self.config.trainer.default_local_dir).name + "_rollout_snapshots"))),
+                            snapshot_directory(self.config),
                             self.global_steps, snapshot_rows, provenance)
                         metrics["rollout_snapshot/rollouts"] = len(snapshot_rows)
                         metrics["rollout_snapshot/bytes"] = path.stat().st_size

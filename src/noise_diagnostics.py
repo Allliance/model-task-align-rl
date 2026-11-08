@@ -17,13 +17,37 @@ import re
 import time
 
 
+def snapshot_directory(config):
+    checkpoint_dir = Path(config.trainer.default_local_dir)
+    return config.trainer.get('rollout_snapshot_dir', str(checkpoint_dir.with_name(checkpoint_dir.name + '_rollout_snapshots')))
+
+
+def _sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_json(path, value):
+    temporary = path.with_name(path.name + f'.{os.getpid()}.tmp')
+    with temporary.open('w') as stream:
+        stream.write(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    _sync_directory(path.parent)
+
+
 def invalidate_snapshots_after(directory, restored_step):
     """Retain old payloads, but stop presenting rolled-back trajectories as current."""
     for folder in Path(directory).glob('step_*'):
-        if int(folder.name.removeprefix('step_')) > restored_step:
+        if re.fullmatch(r'step_[0-9]+', folder.name) and int(folder.name.removeprefix('step_')) > restored_step:
             current = folder / 'CURRENT.json'
             if current.exists():
                 current.rename(folder / f'superseded-on-resume-{restored_step}-{time.time_ns()}.json')
+                _sync_directory(folder)
 
 
 def mathador_true_correct(data, extracted, verifier):
@@ -145,7 +169,7 @@ def rollout_records(batch, tokenizer):
             'effective_reward_target': info.get('diagnostic_effective_target', info.get('reward_model', {}).get('ground_truth')),
             'effective_reward_target_mode': info.get('diagnostic_effective_target_mode', extra.get('target_mode')),
             'original_clean_reference': extra.get('original_game_data_str', extra.get('game_data_str')),
-            'is_noisy': bool(info.get('diagnostic_is_noisy', False)),
+            'is_noisy': info.get('diagnostic_is_noisy'),
             'assigned_label_match': info.get('diagnostic_assigned_match'),
             'true_correct': info.get('diagnostic_true_correct'),
             'true_verified': info.get('diagnostic_true_verified'),
@@ -177,7 +201,9 @@ def write_snapshot(directory, step, records, provenance):
         raise ValueError('Duplicate rollout IDs in snapshot')
     folder = Path(directory) / f'step_{step:06d}'
     folder.mkdir(parents=True, exist_ok=True)
-    metadata = {'schema_version': 1, 'training_step': step,
+    _sync_directory(folder.parent)
+    _sync_directory(folder.parent.parent)
+    metadata = {'schema_version': 2, 'training_step': step,
                 'generating_policy_completed_updates': step - 1,
                 'rollouts': len(records), 'groups': len({r['group_id'] for r in records}),
                 'used_in_update_rollouts': sum(bool(r.get('included_in_update')) for r in records),
@@ -194,14 +220,10 @@ def write_snapshot(directory, step, records, provenance):
         destination = folder / f'rollouts-{digest}.jsonl.gz'
         os.replace(temporary, destination)
         marker = destination.with_suffix(destination.suffix + '.manifest.json')
-        temp_marker = marker.with_name(marker.name + f'.{os.getpid()}.tmp')
-        temp_marker.write_text(json.dumps({**metadata, 'sha256': digest,
-                                          'file': destination.name, 'bytes': destination.stat().st_size}, indent=2) + '\n')
-        temp_marker.replace(marker)
-        current = folder / 'CURRENT.json'
-        current_temporary = current.with_name(current.name + f'.{os.getpid()}.tmp')
-        current_temporary.write_text(marker.read_text())
-        current_temporary.replace(current)
+        _sync_directory(folder)
+        manifest = {**metadata, 'sha256': digest, 'file': destination.name, 'bytes': destination.stat().st_size}
+        _atomic_json(marker, manifest)
+        _atomic_json(folder / 'CURRENT.json', manifest)
         return destination
     finally:
         if Path(temporary).exists():
