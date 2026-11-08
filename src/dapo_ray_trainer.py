@@ -393,7 +393,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # Observe completed training data without changing rewards or updates.
                     observer = getattr(self, "_observe_training_batch", None)
                     if observer is not None:
-                        observer(batch, metrics)
+                        with marked_timer("observability", timing_raw, "cyan"):
+                            observer(batch, metrics)
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
