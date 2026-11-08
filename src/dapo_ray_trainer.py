@@ -369,6 +369,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                         )
 
+                    # Read-only extension: observation cannot influence group filtering or advantages.
+                    if hasattr(self, "_observe_training_batch"):
+                        with marked_timer("observability", timing_raw):
+                            metrics.update(self._observe_training_batch(batch))
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, "pink"):
@@ -388,6 +393,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                                for value in metrics.values()):
                             self._progress("nonfinite_metrics", metrics)
                         self._completed_updates = self.global_steps
+                        if hasattr(self, "_training_update_observed"):
+                            self._training_update_observed(batch)
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
