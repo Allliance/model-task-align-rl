@@ -80,10 +80,11 @@ class RayDAPOTrainer(RayPPOTrainer):
         super()._save_checkpoint()
         if os.environ.get("SYNLOGIC_RUN_ROOT"):
             folder = Path(self.config.trainer.default_local_dir) / f"global_step_{self.global_steps}"
-            required = ["data.pt", "actor/model_world_size_1_rank_0.pt",
-                        "actor/optim_world_size_1_rank_0.pt", "actor/extra_state_world_size_1_rank_0.pt"]
+            world = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.nnodes)
+            required = ["data.pt"] + [f"actor/{kind}_world_size_{world}_rank_{rank}.pt"
+                for rank in range(world) for kind in ("model", "optim", "extra_state")]
             if any(not (folder / name).is_file() or (folder / name).stat().st_size == 0 for name in required):
-                raise RuntimeError("A single-rank full-state checkpoint is incomplete")
+                raise RuntimeError("A full-state checkpoint is incomplete")
             self._progress("checkpoint_complete")
 
     def validate(self):
