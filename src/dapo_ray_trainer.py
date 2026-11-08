@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import uuid
+import hashlib
 import json
 import math
 import os
@@ -40,6 +41,7 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.ray_trainer import AdvantageEstimator, RayPPOTrainer, apply_kl_penalty, compute_advantage, compute_response_mask
 from verl.utils.debug import marked_timer
+from src.noise_diagnostics import noise_metrics, capture_diagnostics, snapshot_due, rollout_records, attach_advantages, write_snapshot, invalidate_snapshots_after, snapshot_directory
 
 
 class RayDAPOTrainer(RayPPOTrainer):
@@ -126,6 +128,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        invalidate_snapshots_after(snapshot_directory(self.config), self.global_steps)
         first_step_after_load = self.global_steps + 1
         self._completed_updates = self.global_steps
         self._progress("loaded")
@@ -154,6 +157,8 @@ class RayDAPOTrainer(RayPPOTrainer):
         batch = None
         num_prompt_in_batch = 0
         num_gen_batches = 0
+        snapshot_rows = []
+        diagnostic_observations = []
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 do_profile = self.global_steps in (self.config.trainer.profile_steps or [])
@@ -235,6 +240,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                             reward_extra_infos_dict = {}
 
                         new_batch.batch["token_level_scores"] = reward_tensor
+                        new_batch.non_tensor_batch["diagnostic_rollout_id"] = np.array(
+                            [f"{self.global_steps}:{uid}:{i}" for i, uid in enumerate(new_batch.non_tensor_batch["uid"])], dtype=object)
 
                         if reward_extra_infos_dict:
                             new_batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -245,6 +252,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                             metrics.update(kl_metrics)  # TODO: This will be cleared if we use multiple genenration batches
                         else:
                             new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
+
+                    diagnostic_observations.extend(capture_diagnostics(new_batch))
+                    if snapshot_due(self.global_steps, self.config.trainer.test_freq,
+                                    self.total_training_steps, self.val_reward_fn is not None):
+                        snapshot_rows.extend(rollout_records(new_batch, self.tokenizer))
 
                     if not self.config.algorithm.filter_groups.enable:
                         batch = new_batch
@@ -373,6 +385,11 @@ class RayDAPOTrainer(RayPPOTrainer):
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                         )
 
+                    metrics.update(noise_metrics(batch, diagnostic_observations))
+                    diagnostic_observations = []
+                    if snapshot_rows:
+                        attach_advantages(snapshot_rows, batch)
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, "pink"):
@@ -392,6 +409,20 @@ class RayDAPOTrainer(RayPPOTrainer):
                                for value in metrics.values()):
                             self._progress("nonfinite_metrics", metrics)
                         self._completed_updates = self.global_steps
+
+                    if snapshot_rows:
+                        provenance = OmegaConf.to_container(self.config.provenance, resolve=True) if self.config.get("provenance") is not None else {}
+                        provenance.update(experiment_name=self.config.trainer.experiment_name, seed=self.config.data.get("seed"))
+                        provenance.update(resolved_config_sha256=hashlib.sha256(json.dumps(OmegaConf.to_container(self.config, resolve=True), sort_keys=True, default=str).encode()).hexdigest(),
+                                          next_evaluation_step=self.global_steps + 1,
+                                          allocation_id=os.environ.get("SYNLOGIC_ALLOCATION_ID"),
+                                          attempt=os.environ.get("SYNLOGIC_ATTEMPT"))
+                        path = write_snapshot(
+                            snapshot_directory(self.config),
+                            self.global_steps, snapshot_rows, provenance)
+                        metrics["rollout_snapshot/rollouts"] = len(snapshot_rows)
+                        metrics["rollout_snapshot/bytes"] = path.stat().st_size
+                        snapshot_rows = []
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
