@@ -205,6 +205,12 @@ class RLHFDataset(Dataset):
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict: dict = self.dataframe[item]
+        # Freeze dataset corruption/target annotations before any online label
+        # refiner temporarily changes the effective reward target.
+        extra = row_dict.get("extra_info", {})
+        if "game_data_str" in extra:
+            extra.setdefault("diagnostic_is_noisy", extra.get("target_mode") == "fixed_wrong_answer")
+            extra.setdefault("diagnostic_assigned_answer_key", extra.get("assigned_answer_key"))
         messages = self._build_messages(row_dict)
         model_inputs = {}
 
