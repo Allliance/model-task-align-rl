@@ -142,7 +142,8 @@ def rollout_records(batch, tokenizer):
             'prompt': tokenizer.decode(prompt_ids, skip_special_tokens=False),
             'response': tokenizer.decode(response_ids, skip_special_tokens=False),
             'assigned_label': extra.get('diagnostic_assigned_answer_key', extra.get('assigned_answer_key')),
-            'effective_reward_target': info.get('reward_model', {}).get('ground_truth'),
+            'effective_reward_target': info.get('diagnostic_effective_target', info.get('reward_model', {}).get('ground_truth')),
+            'effective_reward_target_mode': info.get('diagnostic_effective_target_mode', extra.get('target_mode')),
             'original_clean_reference': extra.get('original_game_data_str', extra.get('game_data_str')),
             'is_noisy': bool(info.get('diagnostic_is_noisy', False)),
             'assigned_label_match': info.get('diagnostic_assigned_match'),
@@ -179,6 +180,7 @@ def write_snapshot(directory, step, records, provenance):
     metadata = {'schema_version': 1, 'training_step': step,
                 'generating_policy_completed_updates': step - 1,
                 'rollouts': len(records), 'groups': len({r['group_id'] for r in records}),
+                'used_in_update_rollouts': sum(bool(r.get('included_in_update')) for r in records),
                 'complete': True, **provenance}
     fd, temporary = tempfile.mkstemp(prefix='.writing-', dir=folder)
     try:

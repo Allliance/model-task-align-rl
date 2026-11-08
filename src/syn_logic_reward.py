@@ -333,6 +333,8 @@ class SynLogicRewardManager:
                         error = bool(shadow.get("verifier_timed_out") or shadow.get("verifier_unverified"))
                         verified = not error
                 for key, value in {
+                    "diagnostic_effective_target": extra_info.get("assigned_answer_key") if extra_info.get("target_mode") == "fixed_wrong_answer" else ground_truth,
+                    "diagnostic_effective_target_mode": extra_info.get("target_mode", "original_verifier"),
                     "diagnostic_is_noisy": frozen_noisy,
                     "diagnostic_assigned_match": assigned_match,
                     "diagnostic_assigned_error": assigned_error,
