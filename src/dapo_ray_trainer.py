@@ -409,6 +409,9 @@ class RayDAPOTrainer(RayPPOTrainer):
                                for value in metrics.values()):
                             self._progress("nonfinite_metrics", metrics)
                         self._completed_updates = self.global_steps
+                        if self.config.get("curriculum") is not None:
+                            self._observe_training_batch(batch, metrics)
+
 
                     if snapshot_rows:
                         provenance = OmegaConf.to_container(self.config.provenance, resolve=True) if self.config.get("provenance") is not None else {}
@@ -438,7 +441,7 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                     first_recovery_save = bool(os.environ.get("SYNLOGIC_RUN_ROOT")) and self.global_steps == first_step_after_load
                     draining = time.time() >= float(os.environ.get("SYNLOGIC_LEASE_DRAIN_EPOCH", "inf"))
-                    if self.config.trainer.save_freq > 0 and (first_recovery_save or draining or is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
+                    if self.config.trainer.save_freq > 0 and (draining or is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with marked_timer("save_checkpoint", timing_raw, "green"):
                             self._save_checkpoint()
 

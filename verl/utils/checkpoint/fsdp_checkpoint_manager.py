@@ -94,6 +94,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if local_path is None:
             return
 
+        if os.path.isfile(os.path.join(local_path, "fork-full-state.json")):
+            from .fork_full_state import load_fork
+            load_fork(self, local_path)
+            return
+
         # check if the checkpoint_load_contents is valid
         if self.should_load_model:
             assert self.model is not None, "model must be provided when checkpoint_contents.load includes ['model']"
