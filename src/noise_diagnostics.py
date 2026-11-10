@@ -194,6 +194,13 @@ def attach_advantages(records, batch):
             row.update(included_in_update=True, update_occurrences=len(indices),
                        advantages=batch.batch['advantages'][i, mask].tolist(),
                        response_loss_mask=batch.batch['response_mask'][i, mask].tolist())
+            for name in ('outcome_advantages', 'teacher_advantages', 'teacher_log_probs',
+                         'old_log_probs', 'ref_log_prob'):
+                if name in batch.batch:
+                    row[name] = batch.batch[name][i, mask].tolist()
+            for name in ('opd_teacher_coefficient', 'opd_outcome_coefficient'):
+                if name in batch.meta_info:
+                    row[name] = batch.meta_info[name]
 
 
 def write_snapshot(directory, step, records, provenance):

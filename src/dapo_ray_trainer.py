@@ -48,6 +48,10 @@ class RayDAPOTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
+    def _transform_advantages(self, batch, metrics):
+        """Optional auxiliary policy feedback, applied before logging actual advantages."""
+        return batch
+
     def _progress(self, phase, metrics=None):
         run_root = os.environ.get("SYNLOGIC_RUN_ROOT")
         if not run_root:
@@ -385,6 +389,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                         )
 
+                    batch = self._transform_advantages(batch, metrics)
                     metrics.update(noise_metrics(batch, diagnostic_observations))
                     diagnostic_observations = []
                     if snapshot_rows:
@@ -436,7 +441,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                            for value in metrics.values()):
                         self._progress("nonfinite_metrics", metrics)
 
-                    first_recovery_save = bool(os.environ.get("SYNLOGIC_RUN_ROOT")) and self.global_steps == first_step_after_load
+                    first_recovery_save = (self.config.trainer.get("save_initial_recovery_checkpoint", False)
+                                           and self.global_steps == first_step_after_load)
                     draining = time.time() >= float(os.environ.get("SYNLOGIC_LEASE_DRAIN_EPOCH", "inf"))
                     if self.config.trainer.save_freq > 0 and (first_recovery_save or draining or is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with marked_timer("save_checkpoint", timing_raw, "green"):

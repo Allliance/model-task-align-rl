@@ -97,6 +97,8 @@ class RLHFDataset(Dataset):
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        self.apply_chat_template_kwargs = dict(config.get('apply_chat_template_kwargs', {}))
+        self.base_generation_prompt = config.get('base_generation_prompt', False)
 
         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
         self.prompt_key = config.get("prompt_key", "prompt")
@@ -148,7 +150,8 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     messages = self._build_messages(doc)
-                    raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+                    raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False,
+                                                                     **self.apply_chat_template_kwargs)
                     images = [process_image(image) for image in messages.pop(image_key)] if image_key in messages else None
                     videos = [process_video(video) for video in messages.pop(video_key)] if video_key in messages else None
 
@@ -157,7 +160,8 @@ class RLHFDataset(Dataset):
             else:
 
                 def doc2len(doc) -> int:
-                    return len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True))
+                    raw = self._render_text_prompt(tokenizer, doc[prompt_key])
+                    return len(tokenizer.encode(raw, add_special_tokens=False))
 
             self.dataframe = self.dataframe.filter(
                 lambda doc: doc2len(doc) <= self.max_prompt_length,
@@ -200,6 +204,17 @@ class RLHFDataset(Dataset):
 
         return messages
 
+    def _render_text_prompt(self, tokenizer, messages):
+        if self.base_generation_prompt:
+            # Preserve the released Base checkpoint's assistant prefix exactly.
+            # False is explicit; no empty Instruct thinking prefill is injected.
+            if self.apply_chat_template_kwargs.get('enable_thinking') is not False:
+                raise ValueError('Base prompt rendering requires explicit thinking=False')
+            return tokenizer.apply_chat_template(messages, add_generation_prompt=False, tokenize=False,
+                                                  **self.apply_chat_template_kwargs) + '<|im_start|>assistant\n'
+        return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False,
+                                              **self.apply_chat_template_kwargs)
+
     def __getitem__(self, item):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
@@ -217,7 +232,8 @@ class RLHFDataset(Dataset):
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
 
-            raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False,
+                                                             **self.apply_chat_template_kwargs)
             multi_modal_data = {}
 
             images = None
@@ -246,7 +262,7 @@ class RLHFDataset(Dataset):
             row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
 
         else:
-            raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            raw_prompt = self._render_text_prompt(self.tokenizer, messages)
             model_inputs = self.tokenizer(raw_prompt, return_tensors="pt", add_special_tokens=False)
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")
