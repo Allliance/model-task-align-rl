@@ -170,6 +170,8 @@ def rollout_records(batch, tokenizer):
             'effective_reward_target_mode': info.get('diagnostic_effective_target_mode', extra.get('target_mode')),
             'original_clean_reference': extra.get('original_game_data_str', extra.get('game_data_str')),
             'is_noisy': info.get('diagnostic_is_noisy'),
+            'corruption_type': extra.get('corruption_type'),
+            'ambiguity_annotation': extra.get('ambiguity_annotation'),
             'assigned_label_match': info.get('diagnostic_assigned_match'),
             'true_correct': info.get('diagnostic_true_correct'),
             'true_verified': info.get('diagnostic_true_verified'),
