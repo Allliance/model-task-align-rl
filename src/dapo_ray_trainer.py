@@ -444,7 +444,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                     first_recovery_save = (self.config.trainer.get("save_initial_recovery_checkpoint", False)
                                            and self.global_steps == first_step_after_load)
                     draining = time.time() >= float(os.environ.get("SYNLOGIC_LEASE_DRAIN_EPOCH", "inf"))
-                    if self.config.trainer.save_freq > 0 and (first_recovery_save or draining or is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
+                    if self.config.trainer.save_freq > 0 and (first_recovery_save or is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with marked_timer("save_checkpoint", timing_raw, "green"):
                             self._save_checkpoint()
 
