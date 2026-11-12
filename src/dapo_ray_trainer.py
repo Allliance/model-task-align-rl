@@ -48,6 +48,9 @@ class RayDAPOTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
+    def _actor_update_batch(self, batch):
+        return batch
+
     def _transform_advantages(self, batch, metrics):
         """Optional auxiliary policy feedback, applied before logging actual advantages."""
         return batch
@@ -407,7 +410,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                         # update actor
                         self._progress("updating_actor")
                         with marked_timer("update_actor", timing_raw, "red"):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output = self.actor_rollout_wg.update_actor(self._actor_update_batch(batch))
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
                         if any(isinstance(value, (int, float, np.number)) and not math.isfinite(float(value))
