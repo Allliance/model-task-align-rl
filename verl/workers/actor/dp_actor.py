@@ -159,9 +159,11 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
+                    if 'eopd_teacher_ids' in micro_batch.keys():
+                        self._eopd_student_lp=self._eopd_probabilities(logits_rmpad,micro_batch,indices)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    inplace_backward = True
+                    inplace_backward = "eopd_teacher_ids" not in micro_batch.keys()
                     if calculate_entropy:
                         inplace_backward = False
                     log_probs = logprobs_from_logits(
@@ -234,12 +236,35 @@ class DataParallelPPOActor(BasePPOActor):
                     logits = output.logits
 
                     logits.div_(temperature)
+                    if 'eopd_teacher_ids' in micro_batch.keys():
+                        self._eopd_student_lp=self._eopd_probabilities(logits,micro_batch)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
-                    log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    log_probs = logprobs_from_logits(logits, micro_batch["responses"],
+                        inplace_backward="eopd_teacher_ids" not in micro_batch.keys())
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
             return entropy, log_probs
+
+    def _eopd_probabilities(self,logits,micro_batch,indices=None):
+        assert not self.use_ulysses_sp and not self.use_fused_kernels
+        response_mask=micro_batch['attention_mask'][:,-micro_batch['responses'].shape[1]:].bool()
+        b,r=response_mask.shape;s=micro_batch['input_ids'].shape[1]
+        positions=(torch.arange(b,device=logits.device)[:,None]*s+torch.arange(s-r-1,s-1,device=logits.device)[None,:]).flatten()
+        valid=response_mask.flatten();positions=positions[valid]
+        if indices is not None:
+            packed=torch.searchsorted(indices,positions)
+            assert torch.equal(indices[packed],positions),'Response prediction positions absent from packed sequence'
+            selected=logits[packed]
+        else:selected=logits.reshape(-1,logits.shape[-1])[positions]
+        ids=micro_batch['eopd_teacher_ids'].reshape(-1,micro_batch['eopd_teacher_ids'].shape[-1])[valid].long()
+        z=selected.float();normalizer=torch.logsumexp(z,-1,keepdim=True);lp=z.gather(-1,ids)-normalizer
+        labels=micro_batch['responses'].flatten()[valid,None]
+        chosen=z.gather(-1,labels).squeeze(-1)-normalizer.squeeze(-1)
+        self._eopd_alignment_lp=chosen.detach()
+
+        output=lp.new_zeros((b*r,ids.shape[-1])).index_copy(0,valid.nonzero().flatten(),lp)
+        return output.reshape(b,r,-1)
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -334,6 +359,17 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        eopd=self.config.get('eopd', False)
+        if eopd:
+            assert not multi_turn and not self.config.use_kl_loss and self.config.entropy_coeff == 0
+            assert self.config.get('opd_loss_mode') == 'ppo_clipped_teacher'
+            assert self.config.opd_teacher_coefficient == 1 and self.config.opd_outcome_coefficient == 0
+            assert self.config.loss_agg_mode == 'token-mean'
+            assert self.config.clip_ratio == self.config.clip_ratio_low == self.config.clip_ratio_high == .2
+            assert self.config.clip_ratio_c >= 1e9  # Inactive beyond the native exp(20) ratio guard.
+            assert 'global_minibatch_response_tokens' in data.batch
+            assert 'legacy_global_minibatch_rows' not in data.batch and 'sample_weights' not in data.batch
+            select_keys += ['eopd_teacher_ids','eopd_teacher_lp','eopd_teacher_entropy']
         separate_opd = self.config.get("opd_loss_mode") == "importance_sampling"
         if separate_opd:
             if (data.meta_info.get("opd_loss_mode") != "importance_sampling"
@@ -392,6 +428,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
                 opd_minibatch_loss = 0.0
+                if eopd:eopd_sums=torch.zeros(6,device=get_device_id(),dtype=torch.float64)
 
                 for data in micro_batches:
                     # Support all hardwares
@@ -446,6 +483,28 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
+
+                    if eopd:
+                        from verl.trainer.ppo.eopd_loss import forward_kl
+                        if not getattr(self,'_eopd_alignment_checked',False):
+                            difference=(self._eopd_alignment_lp-log_prob[response_mask.bool()].detach()).abs()
+                            assert difference.max()<1e-3 and difference.mean()<1e-4, 'EOPD current-student causal probability alignment failed'
+                            import json,os,time
+                            from pathlib import Path
+                            root=Path(os.environ['SYNLOGIC_RUN_ROOT']);rank=torch.distributed.get_rank()
+                            (root/f'eopd-gpu-alignment-student-rank{rank}.json').write_text(json.dumps({
+                                'passed':True,'positions':len(difference),'mean_abs_difference':float(difference.mean()),
+                                'max_abs_difference':float(difference.max()),'epoch':time.time()})+'\n')
+                            self._eopd_alignment_checked=True
+                        fkl,stats=forward_kl(self._eopd_student_lp,data['eopd_teacher_lp'],
+                                             data['eopd_teacher_entropy'],response_mask)
+                        # Both means use every original valid response token; the
+                        # existing DP/minibatch scaling below is applied once.
+                        policy_loss=policy_loss+fkl
+                        n=response_mask.sum()
+                        eopd_sums += torch.stack([pg_loss.detach()*n,fkl.detach()*n,
+                            stats['entropy_sum'],stats['retained_mass_sum'],stats['gated_tokens'],n]).double()
+                        del self._eopd_student_lp
 
                     if separate_opd:
                         # Sampled-token reverse KL, gamma=0. Keep this term
@@ -505,6 +564,18 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()
+                if eopd:
+                    torch.distributed.all_reduce(eopd_sums)
+                    assert torch.allclose(eopd_sums[-1],denominator.double()), 'EOPD token denominator differs from original global minibatch'
+                    totals=eopd_sums.tolist();count=totals[-1]
+                    append_to_dict(metrics,{
+                        'actor/eopd_rkl_loss':totals[0]/count,
+                        'actor/eopd_fkl_loss':totals[1]/count,
+                        'actor/eopd_teacher_entropy':totals[2]/count,
+                        'actor/eopd_teacher_top16_mass':totals[3]/count,
+                        'actor/eopd_gate_fraction':totals[4]/count,
+                        'actor/eopd_gated_tokens':totals[4],
+                        'actor/eopd_original_tokens':count})
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 if separate_opd:
                     # DataProto.concat retains rank-zero metadata. Publish the
