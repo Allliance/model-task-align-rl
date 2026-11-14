@@ -239,7 +239,8 @@ class DataParallelPPOActor(BasePPOActor):
                     if 'opsd_teacher_ids' in micro_batch:
                         self._opsd_student_lp=self._opsd_probabilities(logits,micro_batch)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
-                    log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    log_probs = logprobs_from_logits(logits, micro_batch["responses"],
+                                                     inplace_backward="opsd_teacher_ids" not in micro_batch)
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
@@ -358,10 +359,17 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
-        oracle_opsd=self.config.get('oracle_opsd',False)
+        shared_opsd=self.config.get('shared_current_opsd',False)
+        oracle_opsd=self.config.get('oracle_opsd',False) or shared_opsd
         if oracle_opsd:
             assert not self.config.use_kl_loss and self.config.entropy_coeff==0
-            select_keys += ['opsd_teacher_ids','opsd_teacher_lp','teacher_log_probs']
+            if shared_opsd:
+                assert data.meta_info['shared_current_opsd'] and hasattr(self,'shared_teacher_callback')
+                select_keys += ['opsd_privileged_'+key for key in ['prompts','input_ids','attention_mask','position_ids']]
+                select_keys += [key for key in ['opsd_capture_targets','opsd_snapshot_row_index','opsd_teacher_policy_version'] if key in data.batch]
+                policy_outer_step=int(data.meta_info['opsd_policy_outer_step'])
+            else:
+                select_keys += ['opsd_teacher_ids','opsd_teacher_lp','teacher_log_probs']
         separate_opd = self.config.get("opd_loss_mode") == "importance_sampling"
         if separate_opd:
             if (data.meta_info.get("opd_loss_mode") != "importance_sampling"
@@ -402,6 +410,8 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
+        if shared_opsd:
+            assert self.config.ppo_epochs==1 and len(dataloader)==5,'Shared teacher version contract requires exactly five optimizer updates per outer'
 
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
@@ -414,7 +424,24 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                    if shared_opsd:
+                        # Plan execution using both contexts; optimization still
+                        # receives original student masks and global token means.
+                        work=mini_batch['attention_mask'].sum(-1)+mini_batch['opsd_privileged_attention_mask'].sum(-1)
+                        assert int(work.max())<=max_token_len,'One paired context exceeds the execution token budget'
+                        planner=mini_batch.clone()
+                        planner['attention_mask']=torch.arange(int(work.max()),device=work.device)[None,:]<work[:,None]
+                        minimum=None
+                        while True:
+                            _,parts=rearrange_micro_batches(planner,max_token_len=max_token_len,min_num_micro_batch=minimum)
+                            overflow=torch.tensor(int(any(work[rows].sum()>max_token_len for rows in parts)),device=work.device)
+                            torch.distributed.all_reduce(overflow,op=torch.distributed.ReduceOp.MAX)
+                            if not overflow.item():break
+                            minimum=len(parts)+1
+                            assert minimum<=len(mini_batch),'Unable to prepare bounded shared-context microbatches'
+                        micro_batches=[mini_batch[rows] for rows in parts]
+                    else:
+                        micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
                 else:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     # split batch into micro_batches
@@ -453,9 +480,21 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
+                    if shared_opsd:
+                        policy_version=(policy_outer_step-1)*len(dataloader)+epoch*len(dataloader)+batch_idx
+                        targets=self.shared_teacher_callback(data,temperature,policy_version)
+                        assert all(not value.requires_grad for value in targets.values())
+                        data.update(targets)
+                        metrics['actor/opsd_teacher_policy_version']=float(policy_version)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
 
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                    if oracle_opsd:
+                        # Direct FKL has no PPO objective, even as a discarded
+                        # intermediate. Preserve ordinary metric shapes only.
+                        pg_loss=log_prob.sum()*0
+                        pg_clipfrac=ppo_kl=pg_clipfrac_lower=log_prob.new_zeros(())
+                    else:
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,

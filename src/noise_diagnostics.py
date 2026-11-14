@@ -143,7 +143,7 @@ def noise_metrics(batch, generated=None):
         metrics['noise/noise_learnability'] = counts['assigned_matches'] / len(nr)
         metrics['noise/true_learnability'] = counts['true_correct'] / len(nr)
         metrics['noise/true_verifier_coverage'] = counts['true_verified'] / len(nr)
-    if batch.meta_info.get('oracle_opsd'):
+    if batch.meta_info.get('oracle_opsd') or batch.meta_info.get('shared_current_opsd'):
         # A direct forward-KL objective has no PPO advantage activity statistic.
         for key in ['noise/active_groups','noise/active_rollouts','noise/active_rate','noise/active_rollout_rate']:
             metrics.pop(key,None)
@@ -209,6 +209,16 @@ def attach_advantages(records, batch):
                 row['privileged_clean_answer']=batch.non_tensor_batch['oracle_answer'][i]
                 row['privileged_answer_source']=batch.non_tensor_batch['oracle_answer_source'][i]
                 row['oracle_answer_map_sha256']=batch.meta_info['oracle_answer_map_sha256']
+            if 'retrieval_manifest_sha256' in batch.meta_info:
+                row['retrieval_manifest_sha256']=batch.meta_info['retrieval_manifest_sha256']
+                for field in ['reference_question_id','reference_rollout_id','document_id']:
+                    row['retrieval_'+field]=batch.non_tensor_batch['retrieval_'+field][i]
+                if batch.meta_info.get('shared_current_opsd'):
+                    row['optimization_objective']='current_shared_teacher_forward_kl_top100_plus_tail'
+                    row['teacher_weight_version_rule']='same current actor immediately before each optimizer minibatch; targets stop-gradient; no EMA, lag or frozen shadow'
+                    # Each original prompt group remains in one of five global
+                    # optimizer minibatches, before rank-major DP permutation.
+                    row['teacher_policy_version']=int(batch.batch['opsd_teacher_policy_version'][i])
             for name in ('opd_teacher_coefficient', 'opd_outcome_coefficient'):
                 if name in batch.meta_info:
                     row[name] = batch.meta_info[name]
