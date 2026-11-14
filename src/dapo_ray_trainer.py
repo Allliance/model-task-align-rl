@@ -51,6 +51,12 @@ class RayDAPOTrainer(RayPPOTrainer):
     def _actor_update_batch(self, batch):
         return batch
 
+    def _prepare_policy_scoring(self, batch, metrics):
+        return batch
+
+    def _reference_policy_required(self, batch):
+        return self.use_reference_policy
+
     def _transform_advantages(self, batch, metrics):
         """Optional auxiliary policy feedback, applied before logging actual advantages."""
         return batch
@@ -355,6 +361,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    batch = self._prepare_policy_scoring(batch, metrics)
+
                     # recompute old_log_probs
                     self._progress("computing_log_probs")
                     with marked_timer("old_log_prob", timing_raw, "blue"):
@@ -368,7 +376,7 @@ class RayDAPOTrainer(RayPPOTrainer):
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
-                    if self.use_reference_policy:
+                    if self._reference_policy_required(batch):
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, "olive"):
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
@@ -421,6 +429,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     if snapshot_rows:
                         provenance = OmegaConf.to_container(self.config.provenance, resolve=True) if self.config.get("provenance") is not None else {}
                         provenance.update(experiment_name=self.config.trainer.experiment_name, seed=self.config.data.get("seed"))
+                        if 'alternating_phase' in batch.meta_info:
+                            provenance['alternating_phase'] = batch.meta_info['alternating_phase']
                         provenance.update(resolved_config_sha256=hashlib.sha256(json.dumps(OmegaConf.to_container(self.config, resolve=True), sort_keys=True, default=str).encode()).hexdigest(),
                                           next_evaluation_step=self.global_steps + 1,
                                           allocation_id=os.environ.get("SYNLOGIC_ALLOCATION_ID"),

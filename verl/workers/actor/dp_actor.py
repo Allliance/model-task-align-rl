@@ -334,11 +334,39 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        alternating = self.config.get("alternating_rl_taopd", False)
+        teacher_coefficient = self.config.get("opd_teacher_coefficient", 0.)
+        outcome_coefficient = self.config.get("opd_outcome_coefficient", 1.)
         separate_opd = self.config.get("opd_loss_mode") == "importance_sampling"
+        if alternating:
+            from src.alternating_opd import phase_for_step
+            phase = data.meta_info.get("alternating_phase", {})
+            if (phase != phase_for_step(phase.get("outer_step")) or self.config.use_kl_loss
+                    or self.config.entropy_coeff != 0 or self.config.ppo_epochs != 1
+                    or self.config.get("opd_loss_mode") != "importance_sampling"):
+                raise ValueError("Actor absolute alternating phase/configuration differs")
+            if 'global_minibatch_response_tokens' not in data.batch:
+                raise ValueError('Alternating actor requires global original-token denominators')
+            prior = [float(value['step']) for value in self.actor_optimizer.state.values() if 'step' in value]
+            expected_prior = (phase['outer_step'] - 1) * 5
+            if (not prior and expected_prior != 0) or any(counter != expected_prior for counter in prior):
+                raise ValueError('Loaded optimizer counter differs before the alternating update')
+            teacher_coefficient = phase['teacher_coefficient']
+            outcome_coefficient = phase['outcome_coefficient']
+            separate_opd = phase['phase'] == 'ta_opd'
+            if (data.meta_info.get('opd_teacher_coefficient') != teacher_coefficient
+                    or data.meta_info.get('opd_outcome_coefficient') != outcome_coefficient):
+                raise ValueError("Actor phase coefficients differ from trainer")
+            if not separate_opd and (data.meta_info.get('opd_loss_mode') != 'rl_only'
+                    or any(k.startswith('ta_') or k in ('opd_token_mask', 'global_opd_response_tokens',
+                        'teacher_advantages', 'outcome_advantages', 'teacher_log_probs') for k in data.batch.keys())):
+                raise ValueError("Opposing teacher branch data entered RL actor")
+            if separate_opd and 'opd_token_mask' not in data.batch:
+                raise ValueError("TA actor requires the current selected-token mask")
         if separate_opd:
             if (data.meta_info.get("opd_loss_mode") != "importance_sampling"
-                    or data.meta_info.get("opd_teacher_coefficient") != self.config.opd_teacher_coefficient
-                    or data.meta_info.get("opd_outcome_coefficient") != self.config.opd_outcome_coefficient
+                    or data.meta_info.get("opd_teacher_coefficient") != teacher_coefficient
+                    or data.meta_info.get("opd_outcome_coefficient") != outcome_coefficient
                     or "global_minibatch_response_tokens" not in data.batch):
                 raise ValueError("Actor OPD objective differs from the checked trainer objective")
         elif data.meta_info.get("opd_loss_mode") == "importance_sampling":
@@ -410,7 +438,7 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = attention_mask[:, -response_length:]
 
                     old_log_prob = data["old_log_probs"]
-                    advantages = (data["outcome_advantages"] * self.config.opd_outcome_coefficient
+                    advantages = (data["outcome_advantages"] * outcome_coefficient
                                   if separate_opd else data["advantages"])
                     sample_weights = data.get("sample_weights")
 
@@ -468,11 +496,11 @@ class DataParallelPPOActor(BasePPOActor):
                                     *data["global_minibatch_response_tokens"][0]/data["global_opd_response_tokens"][0])
                             opd_loss=opd_loss*factor
                         metrics["actor/opd_clipfrac"] = float(opd_clipfrac.detach())
-                        policy_loss = policy_loss + self.config.opd_teacher_coefficient * opd_loss
+                        policy_loss = policy_loss + teacher_coefficient * opd_loss
                         dp_size = torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
                         opd_minibatch_loss += float(opd_loss.detach() * response_mask.sum() * dp_size
                                                     / data["global_minibatch_response_tokens"][0])
-                        metrics["actor/opd_teacher_coefficient"] = self.config.opd_teacher_coefficient
+                        metrics["actor/opd_teacher_coefficient"] = teacher_coefficient
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data["ref_log_prob"]
@@ -527,5 +555,15 @@ class DataParallelPPOActor(BasePPOActor):
                     reported /= torch.distributed.get_world_size()
                     data["actor/opd_loss"] = reported.item()
                 append_to_dict(metrics, data)
+        if alternating:
+            counters = [float(value['step']) for value in self.actor_optimizer.state.values() if 'step' in value]
+            expected = phase['outer_step'] * 5
+            if not counters or any(counter != expected for counter in counters):
+                raise ValueError(f'Actual optimizer counter differs from absolute outer step: expected {expected}')
+            metrics['actor/optimizer_updates'] = min(counters)
+            metrics['actor/phase_number'] = phase['phase_number']
+            metrics['actor/phase_offset'] = phase['phase_offset']
+            metrics['actor/outcome_coefficient'] = outcome_coefficient
+            metrics['actor/teacher_coefficient'] = teacher_coefficient
         self.actor_optimizer.zero_grad()
         return metrics
