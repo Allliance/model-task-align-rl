@@ -345,6 +345,8 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError("Trainer requested separate OPD importance sampling but actor mode differs")
         if separate_opd:
             select_keys += ["teacher_advantages", "outcome_advantages"]
+        if "opd_token_mask" in data.batch:
+            select_keys += ["opd_token_mask", "global_opd_response_tokens"]
         if "legacy_global_minibatch_rows" in data.batch:
             if separate_opd or "global_minibatch_response_tokens" in data.batch:
                 raise ValueError("Legacy and global token normalization are mutually exclusive")
@@ -448,13 +450,24 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = pg_loss
 
                     if separate_opd:
-                        # Sampled-token reverse KL, gamma=0. Keep this term
-                        # outside PPO clipping of the separate GRPO objective.
-                        ratio = torch.exp(log_prob - old_log_prob)
-                        opd_loss = agg_loss(
-                            loss_mat=-ratio * data["teacher_advantages"].detach(),
-                            loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
-                            sample_weights=sample_weights)
+                        selected_mask=response_mask * data.get("opd_token_mask",torch.ones_like(response_mask))
+                        if selected_mask.any():
+                            opd_loss, opd_clipfrac, _, _ = compute_policy_loss(
+                                old_log_prob=old_log_prob,log_prob=log_prob,
+                                advantages=data["teacher_advantages"].detach(),response_mask=selected_mask,
+                                cliprange=clip_ratio,cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,clip_ratio_c=clip_ratio_c,
+                                loss_agg_mode=loss_agg_mode,sample_weights=sample_weights)
+                        else:
+                            opd_loss=log_prob.sum()*0
+                            opd_clipfrac=log_prob.new_zeros(())
+                        if "global_opd_response_tokens" in data:
+                            # Outer backward weights by original tokens / global original tokens.
+                            # Rescale only the teacher term to obtain its independent selected-token mean.
+                            factor=(selected_mask.sum()/response_mask.sum().clamp_min(1)
+                                    *data["global_minibatch_response_tokens"][0]/data["global_opd_response_tokens"][0])
+                            opd_loss=opd_loss*factor
+                        metrics["actor/opd_clipfrac"] = float(opd_clipfrac.detach())
                         policy_loss = policy_loss + self.config.opd_teacher_coefficient * opd_loss
                         dp_size = torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
                         opd_minibatch_loss += float(opd_loss.detach() * response_mask.sum() * dp_size
