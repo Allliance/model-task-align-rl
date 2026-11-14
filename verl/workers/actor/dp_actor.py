@@ -434,7 +434,7 @@ class DataParallelPPOActor(BasePPOActor):
                         minimum=None
                         while True:
                             _,parts=rearrange_micro_batches(planner,max_token_len=max_token_len,min_num_micro_batch=minimum)
-                            overflow=torch.tensor(int(any(work[rows].sum()>max_token_len for rows in parts)),device=work.device)
+                            overflow=torch.tensor(int(any(work[rows].sum()>max_token_len for rows in parts)),device=get_device_id())
                             torch.distributed.all_reduce(overflow,op=torch.distributed.ReduceOp.MAX)
                             if not overflow.item():break
                             minimum=len(parts)+1
@@ -604,6 +604,8 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()
+                if shared_opsd:
+                    assert torch.isfinite(grad_norm),'Nonfinite shared OPSD gradient skipped an Adam update; fail closed'
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 if separate_opd:
                     # DataProto.concat retains rank-zero metadata. Publish the
