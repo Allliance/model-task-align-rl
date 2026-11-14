@@ -143,6 +143,11 @@ def noise_metrics(batch, generated=None):
         metrics['noise/noise_learnability'] = counts['assigned_matches'] / len(nr)
         metrics['noise/true_learnability'] = counts['true_correct'] / len(nr)
         metrics['noise/true_verifier_coverage'] = counts['true_verified'] / len(nr)
+    if batch.meta_info.get('oracle_opsd'):
+        # A direct forward-KL objective has no PPO advantage activity statistic.
+        for key in ['noise/active_groups','noise/active_rollouts','noise/active_rate','noise/active_rollout_rate']:
+            metrics.pop(key,None)
+        metrics['noise/advantage_activity_defined']=0
     return metrics
 
 
@@ -195,9 +200,15 @@ def attach_advantages(records, batch):
                        advantages=batch.batch['advantages'][i, mask].tolist(),
                        response_loss_mask=batch.batch['response_mask'][i, mask].tolist())
             for name in ('outcome_advantages', 'teacher_advantages', 'teacher_log_probs',
-                         'old_log_probs', 'ref_log_prob'):
+                         'old_log_probs', 'ref_log_prob', 'opd_token_mask', 'ta_score',
+                         'ta_disagreement', 'ta_compatibility', 'tip_score', 'tip_entropy', 'tip_rkl'):
                 if name in batch.batch:
                     row[name] = batch.batch[name][i, mask].tolist()
+            if batch.meta_info.get('oracle_opsd'):
+                row['optimization_objective']='privileged_teacher_forward_kl_top100_plus_tail'
+                row['privileged_clean_answer']=batch.non_tensor_batch['oracle_answer'][i]
+                row['privileged_answer_source']=batch.non_tensor_batch['oracle_answer_source'][i]
+                row['oracle_answer_map_sha256']=batch.meta_info['oracle_answer_map_sha256']
             for name in ('opd_teacher_coefficient', 'opd_outcome_coefficient'):
                 if name in batch.meta_info:
                     row[name] = batch.meta_info[name]

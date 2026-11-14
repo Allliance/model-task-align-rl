@@ -159,9 +159,11 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
+                    if 'opsd_teacher_ids' in micro_batch:
+                        self._opsd_student_lp=self._opsd_probabilities(logits_rmpad,micro_batch,indices)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    inplace_backward = True
+                    inplace_backward = "opsd_teacher_ids" not in micro_batch
                     if calculate_entropy:
                         inplace_backward = False
                     log_probs = logprobs_from_logits(
@@ -234,12 +236,34 @@ class DataParallelPPOActor(BasePPOActor):
                     logits = output.logits
 
                     logits.div_(temperature)
+                    if 'opsd_teacher_ids' in micro_batch:
+                        self._opsd_student_lp=self._opsd_probabilities(logits,micro_batch)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
             return entropy, log_probs
+
+    def _opsd_probabilities(self,logits,micro_batch,indices=None):
+        assert not self.use_ulysses_sp and not self.use_fused_kernels
+        response_mask=micro_batch['attention_mask'][:,-micro_batch['responses'].shape[1]:].bool()
+        b,r=response_mask.shape;s=micro_batch['input_ids'].shape[1]
+        positions=(torch.arange(b,device=logits.device)[:,None]*s+torch.arange(s-r-1,s-1,device=logits.device)[None,:]).flatten()
+        valid=response_mask.flatten();positions=positions[valid]
+        if indices is not None:
+            packed=torch.searchsorted(indices,positions)
+            assert torch.equal(indices[packed],positions),'Response prediction positions absent from packed sequence'
+            selected=logits[packed]
+        else:selected=logits.reshape(-1,logits.shape[-1])[positions]
+        ids=micro_batch['opsd_teacher_ids'].reshape(-1,micro_batch['opsd_teacher_ids'].shape[-1])[valid].long()
+        z=selected.float();normalizer=torch.logsumexp(z,-1,keepdim=True);lp=z.gather(-1,ids)-normalizer
+        labels=micro_batch['responses'].flatten()[valid,None]
+        chosen=z.gather(-1,labels).squeeze(-1)-normalizer.squeeze(-1)
+        self._opsd_alignment_lp=chosen.detach()
+
+        output=lp.new_zeros((b*r,ids.shape[-1])).index_copy(0,valid.nonzero().flatten(),lp)
+        return output.reshape(b,r,-1)
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -334,6 +358,10 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        oracle_opsd=self.config.get('oracle_opsd',False)
+        if oracle_opsd:
+            assert not self.config.use_kl_loss and self.config.entropy_coeff==0
+            select_keys += ['opsd_teacher_ids','opsd_teacher_lp','teacher_log_probs']
         separate_opd = self.config.get("opd_loss_mode") == "importance_sampling"
         if separate_opd:
             if (data.meta_info.get("opd_loss_mode") != "importance_sampling"
@@ -345,6 +373,8 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError("Trainer requested separate OPD importance sampling but actor mode differs")
         if separate_opd:
             select_keys += ["teacher_advantages", "outcome_advantages"]
+        if "opd_token_mask" in data.batch:
+            select_keys += ["opd_token_mask", "global_opd_response_tokens"]
         if "legacy_global_minibatch_rows" in data.batch:
             if separate_opd or "global_minibatch_response_tokens" in data.batch:
                 raise ValueError("Legacy and global token normalization are mutually exclusive")
@@ -447,14 +477,44 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         policy_loss = pg_loss
 
+                    if oracle_opsd and not getattr(self,'_opsd_alignment_checked',False):
+                        difference=(self._opsd_alignment_lp-log_prob[response_mask.bool()].detach()).abs()
+                        assert float(difference.mean())<.03 and float(difference.max())<1.,'OPSD actor causal probability alignment failed'
+                        from pathlib import Path
+                        import json,time
+                        root=Path(os.environ['SYNLOGIC_RUN_ROOT']);rank=torch.distributed.get_rank()
+                        (root/f'opsd-gpu-alignment-student-rank{rank}.json').write_text(json.dumps({'passed':True,'positions':len(difference),'mean_abs_difference':float(difference.mean()),'max_abs_difference':float(difference.max()),'epoch':time.time()}))
+                        self._opsd_alignment_checked=True
+                    if oracle_opsd:
+                        from verl.trainer.ppo.opsd_loss import compute_policy_loss_opsd
+                        policy_loss,opsd_metrics=compute_policy_loss_opsd(
+                            old_log_prob,log_prob,advantages,response_mask,config=self.config,
+                            teacher_log_probs=data['teacher_log_probs'].detach(),
+                            student_topk_log_probs=self._opsd_student_lp,
+                            teacher_topk_log_probs=data['opsd_teacher_lp'].detach())
+                        del self._opsd_student_lp
+                        metrics.update({'actor/opsd_'+key:value for key,value in opsd_metrics.items()})
+                        pg_loss=policy_loss
+
                     if separate_opd:
-                        # Sampled-token reverse KL, gamma=0. Keep this term
-                        # outside PPO clipping of the separate GRPO objective.
-                        ratio = torch.exp(log_prob - old_log_prob)
-                        opd_loss = agg_loss(
-                            loss_mat=-ratio * data["teacher_advantages"].detach(),
-                            loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
-                            sample_weights=sample_weights)
+                        selected_mask=response_mask * data.get("opd_token_mask",torch.ones_like(response_mask))
+                        if selected_mask.any():
+                            opd_loss, opd_clipfrac, _, _ = compute_policy_loss(
+                                old_log_prob=old_log_prob,log_prob=log_prob,
+                                advantages=data["teacher_advantages"].detach(),response_mask=selected_mask,
+                                cliprange=clip_ratio,cliprange_low=clip_ratio_low,
+                                cliprange_high=clip_ratio_high,clip_ratio_c=clip_ratio_c,
+                                loss_agg_mode=loss_agg_mode,sample_weights=sample_weights)
+                        else:
+                            opd_loss=log_prob.sum()*0
+                            opd_clipfrac=log_prob.new_zeros(())
+                        if "global_opd_response_tokens" in data:
+                            # Outer backward weights by original tokens / global original tokens.
+                            # Rescale only the teacher term to obtain its independent selected-token mean.
+                            factor=(selected_mask.sum()/response_mask.sum().clamp_min(1)
+                                    *data["global_minibatch_response_tokens"][0]/data["global_opd_response_tokens"][0])
+                            opd_loss=opd_loss*factor
+                        metrics["actor/opd_clipfrac"] = float(opd_clipfrac.detach())
                         policy_loss = policy_loss + self.config.opd_teacher_coefficient * opd_loss
                         dp_size = torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
                         opd_minibatch_loss += float(opd_loss.detach() * response_mask.sum() * dp_size
