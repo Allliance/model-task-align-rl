@@ -159,6 +159,7 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
+                    self._pw_opd_alignment(logits_rmpad, micro_batch, indices)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -234,12 +235,52 @@ class DataParallelPPOActor(BasePPOActor):
                     logits = output.logits
 
                     logits.div_(temperature)
+                    self._pw_opd_alignment(logits, micro_batch)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
-            return entropy, log_probs
+        if hasattr(self, "_pw_alignment_expected"):
+            valid = attention_mask[:, -response_length:].bool()
+            delta = (self._pw_alignment_expected - log_probs.detach()[valid]).abs()
+            if delta.numel():
+                assert delta.max() < 1e-3 and delta.mean() < 1e-4, "PW-OPD native chosen-token causal alignment failed"
+                import json, time
+                from pathlib import Path
+                role = "student" if self.actor_optimizer is not None else "teacher"
+                root = os.environ.get("SYNLOGIC_RUN_ROOT")
+                if root:
+                    path = Path(root) / f"pw-opd-gpu-alignment-{role}-rank{torch.distributed.get_rank()}.json"
+                    path.write_text(json.dumps({"passed":True,"positions":delta.numel(),
+                        "max_abs_difference":float(delta.max()),"mean_abs_difference":float(delta.mean()),
+                        "epoch":time.time()}) + "\n")
+                self._pw_alignment_checked = True
+            del self._pw_alignment_expected
+        return entropy, log_probs
+
+    @torch.no_grad()
+    def _pw_opd_alignment(self, logits, micro_batch, indices=None):
+        if not self.config.get("pw_opd", False) or getattr(self, "_pw_alignment_checked", False):
+            return
+        assert not self.use_ulysses_sp
+        b, r = micro_batch["responses"].shape
+        s = micro_batch["input_ids"].shape[-1]
+        valid = micro_batch["attention_mask"][:, -r:].bool()
+        absolute = (torch.arange(b, device=logits.device)[:, None] * s
+                    + torch.arange(s-r-1, s-1, device=logits.device)[None, :])[valid]
+        if indices is not None:
+            locations = torch.searchsorted(indices, absolute)
+            assert torch.equal(indices[locations], absolute), "Valid response predictor missing from native packed context"
+        else:
+            locations = absolute
+        flat = logits.reshape(-1, logits.shape[-1])
+        labels = micro_batch["responses"][valid, None]
+        parts = []
+        for start in range(0, len(locations), 256):
+            z = flat[locations[start:start+256]].float()
+            parts.append((z.gather(-1, labels[start:start+256]) - z.logsumexp(-1, keepdim=True)).squeeze(-1))
+        self._pw_alignment_expected = torch.cat(parts) if parts else flat.new_empty(0)
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -334,6 +375,21 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        pw_opd = self.config.get("pw_opd", False)
+        if pw_opd:
+            assert not multi_turn and not self.config.use_kl_loss and self.config.entropy_coeff == 0
+            assert self.config.get("opd_loss_mode") == "ppo_clipped_teacher"
+            assert self.config.opd_teacher_coefficient == 1 and self.config.opd_outcome_coefficient == 0
+            assert self.config.loss_agg_mode == "token-mean" and self.ulysses_sequence_parallel_size == 1
+            assert self.config.clip_ratio == self.config.clip_ratio_low == self.config.clip_ratio_high == .2
+            assert self.config.clip_ratio_c >= 1e9
+            assert "global_minibatch_response_tokens" in data.batch.keys()
+            assert "legacy_global_minibatch_rows" not in data.batch.keys() and "sample_weights" not in data.batch.keys()
+            assert torch.equal(data.batch["response_mask"], data.batch["attention_mask"][:, -data.batch["responses"].shape[-1]:])
+            from verl.trainer.ppo.position_weighting import response_position_weights
+            # Validate at the full-row boundary, never infer positions in a microbatch.
+            assert torch.equal(data.batch["pw_opd_weights"], response_position_weights(data.batch["response_mask"]))
+            select_keys += ["pw_opd_weights"]
         separate_opd = self.config.get("opd_loss_mode") == "importance_sampling"
         if separate_opd:
             if (data.meta_info.get("opd_loss_mode") != "importance_sampling"
@@ -392,6 +448,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
                 opd_minibatch_loss = 0.0
+                if pw_opd: pw_sums = torch.zeros(3, device=get_device_id(), dtype=torch.float64)
 
                 for data in micro_batches:
                     # Support all hardwares
@@ -436,6 +493,7 @@ class DataParallelPPOActor(BasePPOActor):
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
                         sample_weights=sample_weights,
+                        token_weights=data["pw_opd_weights"] if pw_opd else None,
                     )
 
                     if entropy_coeff != 0:
@@ -446,6 +504,11 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
+
+                    if pw_opd:
+                        n = response_mask.sum()
+                        pw_sums += torch.stack([pg_loss.detach() * n,
+                            data["pw_opd_weights"].sum(), n]).double()
 
                     if separate_opd:
                         # Sampled-token reverse KL, gamma=0. Keep this term
@@ -505,6 +568,12 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()
+                if pw_opd:
+                    torch.distributed.all_reduce(pw_sums)
+                    assert torch.allclose(pw_sums[-1], denominator.double())
+                    total = pw_sums.tolist()
+                    append_to_dict(metrics, {"actor/pw_opd_clipped_loss":total[0]/total[2],
+                        "actor/pw_opd_weight_sum":total[1], "actor/pw_opd_original_tokens":total[2]})
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 if separate_opd:
                     # DataProto.concat retains rank-zero metadata. Publish the

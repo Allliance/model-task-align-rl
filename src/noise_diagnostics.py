@@ -103,7 +103,8 @@ def noise_metrics(batch, generated=None):
     info = batch.non_tensor_batch
     if 'diagnostic_is_noisy' not in info:
         return {}
-    active = ((batch.batch['advantages'] != 0) & batch.batch['response_mask'].bool()).any(-1).tolist()
+    advantages = batch.batch.get('pw_opd_effective_advantages', batch.batch['advantages'])
+    active = ((advantages != 0) & batch.batch['response_mask'].bool()).any(-1).tolist()
     if generated is not None:
         active_by_id = defaultdict(bool)
         for i, uid in enumerate(info['diagnostic_rollout_id']):
@@ -195,6 +196,7 @@ def attach_advantages(records, batch):
                        advantages=batch.batch['advantages'][i, mask].tolist(),
                        response_loss_mask=batch.batch['response_mask'][i, mask].tolist())
             for name in ('outcome_advantages', 'teacher_advantages', 'teacher_log_probs',
+                         'pw_opd_weights', 'pw_opd_effective_advantages',
                          'old_log_probs', 'ref_log_prob'):
                 if name in batch.batch:
                     row[name] = batch.batch[name][i, mask].tolist()

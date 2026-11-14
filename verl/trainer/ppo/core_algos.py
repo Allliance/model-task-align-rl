@@ -642,6 +642,7 @@ def compute_policy_loss(
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
     sample_weights=None,
+    token_weights=None,
 ):
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -693,6 +694,17 @@ def compute_policy_loss(
     pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    if token_weights is not None:
+        # Positive fixed weights preserve both signs of the original PPO clip.
+        # Keep the original token-count denominator and clip diagnostics.
+        if token_weights.shape != response_mask.shape or loss_agg_mode != "token-mean" or sample_weights is not None:
+            raise ValueError("Position weighting requires the baseline unweighted token mean")
+        valid = response_mask.bool()
+        if token_weights.requires_grad or not torch.isfinite(token_weights).all() or (token_weights[valid] <= 0).any():
+            raise ValueError("Position weights must be fixed finite positive scalars on valid tokens")
+        if clip_ratio_c < 1e9:
+            raise ValueError("PW-OPD requires the baseline inactive dual-clip guard")
+        pg_losses = torch.where(valid, pg_losses * token_weights, 0.0)
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
                        sample_weights=sample_weights)
 
