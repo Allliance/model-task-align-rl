@@ -195,7 +195,8 @@ def attach_advantages(records, batch):
                        advantages=batch.batch['advantages'][i, mask].tolist(),
                        response_loss_mask=batch.batch['response_mask'][i, mask].tolist())
             for name in ('outcome_advantages', 'teacher_advantages', 'teacher_log_probs',
-                         'old_log_probs', 'ref_log_prob'):
+                         'old_log_probs', 'ref_log_prob', 'opd_token_mask', 'ta_score',
+                         'ta_disagreement', 'ta_compatibility', 'tip_score', 'tip_entropy', 'tip_rkl', 'tip_fkl'):
                 if name in batch.batch:
                     row[name] = batch.batch[name][i, mask].tolist()
             for name in ('opd_teacher_coefficient', 'opd_outcome_coefficient'):
