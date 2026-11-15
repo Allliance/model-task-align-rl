@@ -96,17 +96,6 @@ class DataParallelPPOActor(BasePPOActor):
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
-            # Padded tensor width can exceed native context; only valid tokens
-            # and their positions constrain a packed/padded causal sequence.
-            unwrapped=self.actor_module
-            while not hasattr(unwrapped,'config'):
-                unwrapped=unwrapped.module if hasattr(unwrapped,'module') else unwrapped.model
-            model_config=unwrapped.config
-            native_limit=model_config.max_position_embeddings
-            valid=micro_batch['attention_mask'].bool()
-            assert (valid.sum(-1)<=native_limit).all(), 'Valid sequence exceeds native context'
-            if position_ids.dim()==2:
-                assert (position_ids[valid]<native_limit).all(), 'Valid position exceeds native context'
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
@@ -170,11 +159,9 @@ class DataParallelPPOActor(BasePPOActor):
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
-                    if 'opsd_teacher_ids' in micro_batch:
-                        self._opsd_student_lp=self._opsd_probabilities(logits_rmpad,micro_batch,indices)
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
-                    inplace_backward = "opsd_teacher_ids" not in micro_batch
+                    inplace_backward = True
                     if calculate_entropy:
                         inplace_backward = False
                     log_probs = logprobs_from_logits(
@@ -247,35 +234,12 @@ class DataParallelPPOActor(BasePPOActor):
                     logits = output.logits
 
                     logits.div_(temperature)
-                    if 'opsd_teacher_ids' in micro_batch:
-                        self._opsd_student_lp=self._opsd_probabilities(logits,micro_batch)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
-                    log_probs = logprobs_from_logits(logits, micro_batch["responses"],
-                                                     inplace_backward="opsd_teacher_ids" not in micro_batch)
+                    log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
 
             return entropy, log_probs
-
-    def _opsd_probabilities(self,logits,micro_batch,indices=None):
-        assert not self.use_ulysses_sp and not self.use_fused_kernels
-        response_mask=micro_batch['attention_mask'][:,-micro_batch['responses'].shape[1]:].bool()
-        b,r=response_mask.shape;s=micro_batch['input_ids'].shape[1]
-        positions=(torch.arange(b,device=logits.device)[:,None]*s+torch.arange(s-r-1,s-1,device=logits.device)[None,:]).flatten()
-        valid=response_mask.flatten();positions=positions[valid]
-        if indices is not None:
-            packed=torch.searchsorted(indices,positions)
-            assert torch.equal(indices[packed],positions),'Response prediction positions absent from packed sequence'
-            selected=logits[packed]
-        else:selected=logits.reshape(-1,logits.shape[-1])[positions]
-        ids=micro_batch['opsd_teacher_ids'].reshape(-1,micro_batch['opsd_teacher_ids'].shape[-1])[valid].long()
-        z=selected.float();normalizer=torch.logsumexp(z,-1,keepdim=True);lp=z.gather(-1,ids)-normalizer
-        labels=micro_batch['responses'].flatten()[valid,None]
-        chosen=z.gather(-1,labels).squeeze(-1)-normalizer.squeeze(-1)
-        self._opsd_alignment_lp=chosen.detach()
-
-        output=lp.new_zeros((b*r,ids.shape[-1])).index_copy(0,valid.nonzero().flatten(),lp)
-        return output.reshape(b,r,-1)
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -338,30 +302,12 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
-        import time
-        call_started = time.time()
-        completed_rows = 0
-        for micro_index, micro_batch in enumerate(micro_batches, 1):
+        for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
             log_probs_lst.append(log_probs)
-            completed_rows += len(micro_batch['responses'])
-            if os.environ.get('SYNLOGIC_RUN_ROOT') and os.environ.get('SYNLOGIC_ALLOCATION_ID') and os.environ.get('SYNLOGIC_ATTEMPT'):
-                # Publish only completed forward work, with no text or token IDs.
-                import json
-                from pathlib import Path
-                valid_tokens = int(micro_batch['attention_mask'].sum().item())
-                role = 'actor' if self.actor_optimizer is not None else 'reference'
-                target = Path(os.environ['SYNLOGIC_RUN_ROOT']) / f'inference-progress-{role}-rank{torch.distributed.get_rank()}.json'
-                progress = dict(epoch=time.time(), call_started=call_started, allocation_id=os.environ['SYNLOGIC_ALLOCATION_ID'],
-                                attempt=os.environ['SYNLOGIC_ATTEMPT'], role=role, rank=torch.distributed.get_rank(),
-                                completed_micro_batches=micro_index, total_micro_batches=len(micro_batches),
-                                completed_rows=completed_rows, total_rows=len(batch), last_valid_tokens=valid_tokens)
-                temporary = target.with_suffix('.tmp')
-                temporary.write_text(json.dumps(progress)+'\n')
-                temporary.replace(target)
             if calculate_entropy:
                 entropy_lst.append(entropy)
 
@@ -383,25 +329,11 @@ class DataParallelPPOActor(BasePPOActor):
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
-        if torch.cuda.is_available():
-            # Release completed rollout/logprob workspaces before training.
-            torch.cuda.empty_cache()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
-        shared_opsd=self.config.get('shared_current_opsd',False)
-        oracle_opsd=self.config.get('oracle_opsd',False) or shared_opsd
-        if oracle_opsd:
-            assert not self.config.use_kl_loss and self.config.entropy_coeff==0
-            if shared_opsd:
-                assert data.meta_info['shared_current_opsd'] and hasattr(self,'shared_teacher_callback')
-                select_keys += ['opsd_privileged_'+key for key in ['prompts','input_ids','attention_mask','position_ids']]
-                select_keys += [key for key in ['opsd_capture_targets','opsd_snapshot_row_index','opsd_teacher_policy_version'] if key in data.batch]
-                policy_outer_step=int(data.meta_info['opsd_policy_outer_step'])
-            else:
-                select_keys += ['opsd_teacher_ids','opsd_teacher_lp','teacher_log_probs']
         separate_opd = self.config.get("opd_loss_mode") == "importance_sampling"
         if separate_opd:
             if (data.meta_info.get("opd_loss_mode") != "importance_sampling"
@@ -413,8 +345,6 @@ class DataParallelPPOActor(BasePPOActor):
             raise ValueError("Trainer requested separate OPD importance sampling but actor mode differs")
         if separate_opd:
             select_keys += ["teacher_advantages", "outcome_advantages"]
-        if "opd_token_mask" in data.batch:
-            select_keys += ["opd_token_mask", "global_opd_response_tokens"]
         if "legacy_global_minibatch_rows" in data.batch:
             if separate_opd or "global_minibatch_response_tokens" in data.batch:
                 raise ValueError("Legacy and global token normalization are mutually exclusive")
@@ -442,8 +372,6 @@ class DataParallelPPOActor(BasePPOActor):
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
-        if shared_opsd:
-            assert self.config.ppo_epochs==1 and len(dataloader)==5,'Shared teacher version contract requires exactly five optimizer updates per outer'
 
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
@@ -456,24 +384,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    if shared_opsd:
-                        # Plan execution using both contexts; optimization still
-                        # receives original student masks and global token means.
-                        work=mini_batch['attention_mask'].sum(-1)+mini_batch['opsd_privileged_attention_mask'].sum(-1)
-                        assert int(work.max())<=max_token_len, (f'One paired context exceeds the execution token budget: paired_max={int(work.max())}, budget={max_token_len}, actor_budget={self.config.ppo_max_token_len_per_gpu}, sp={self.ulysses_sequence_parallel_size}, student_max={int(mini_batch["attention_mask"].sum(-1).max())}, teacher_max={int(mini_batch["opsd_privileged_attention_mask"].sum(-1).max())}, student_width={mini_batch["attention_mask"].shape[-1]}, teacher_width={mini_batch["opsd_privileged_attention_mask"].shape[-1]}')
-                        planner=mini_batch.clone()
-                        planner['attention_mask']=torch.arange(int(work.max()),device=work.device)[None,:]<work[:,None]
-                        minimum=None
-                        while True:
-                            _,parts=rearrange_micro_batches(planner,max_token_len=max_token_len,min_num_micro_batch=minimum)
-                            overflow=torch.tensor(int(any(work[rows].sum()>max_token_len for rows in parts)),device=get_device_id())
-                            torch.distributed.all_reduce(overflow,op=torch.distributed.ReduceOp.MAX)
-                            if not overflow.item():break
-                            minimum=len(parts)+1
-                            assert minimum<=len(mini_batch),'Unable to prepare bounded shared-context microbatches'
-                        micro_batches=[mini_batch[rows] for rows in parts]
-                    else:
-                        micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
                 else:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     # split batch into micro_batches
@@ -482,7 +393,7 @@ class DataParallelPPOActor(BasePPOActor):
                 self.actor_optimizer.zero_grad()
                 opd_minibatch_loss = 0.0
 
-                for micro_index, data in enumerate(micro_batches):
+                for data in micro_batches:
                     # Support all hardwares
                     if isinstance(data, DataProto):
                         data = {**data.batch.to(get_device_id()), **data.non_tensor_batch}
@@ -512,33 +423,9 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    if shared_opsd:
-                        policy_version=(policy_outer_step-1)*len(dataloader)+epoch*len(dataloader)+batch_idx
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        targets=self.shared_teacher_callback(data,temperature,policy_version)
-                        if torch.cuda.is_available():
-                            # The no-grad teacher's logits/workspaces are dead;
-                            # leave physical headroom for external BLAS kernels.
-                            torch.cuda.empty_cache()
-                        assert all(not value.requires_grad for value in targets.values())
-                        data.update(targets)
-                        metrics['actor/opsd_teacher_policy_version']=float(policy_version)
-                    memory_probe = (self.config.get('retrieval_privilege', False) and not oracle_opsd)
-                    if memory_probe:
-                        from src.actor_recovery import actor_memory
-                        actor_memory(self, 'before_student', epoch, batch_idx, micro_index, data, reclaim=True)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
-                    if memory_probe:
-                        actor_memory(self, 'after_student', epoch, batch_idx, micro_index, data)
 
-                    if oracle_opsd:
-                        # Direct FKL has no PPO objective, even as a discarded
-                        # intermediate. Preserve ordinary metric shapes only.
-                        pg_loss=log_prob.sum()*0
-                        pg_clipfrac=ppo_kl=pg_clipfrac_lower=log_prob.new_zeros(())
-                    else:
-                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
@@ -560,44 +447,14 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         policy_loss = pg_loss
 
-                    if oracle_opsd and not getattr(self,'_opsd_alignment_checked',False):
-                        difference=(self._opsd_alignment_lp-log_prob[response_mask.bool()].detach()).abs()
-                        assert float(difference.mean())<.03 and float(difference.max())<1.,'OPSD actor causal probability alignment failed'
-                        from pathlib import Path
-                        import json,time
-                        root=Path(os.environ['SYNLOGIC_RUN_ROOT']);rank=torch.distributed.get_rank()
-                        (root/f'opsd-gpu-alignment-student-rank{rank}.json').write_text(json.dumps({'passed':True,'positions':len(difference),'mean_abs_difference':float(difference.mean()),'max_abs_difference':float(difference.max()),'epoch':time.time()}))
-                        self._opsd_alignment_checked=True
-                    if oracle_opsd:
-                        from verl.trainer.ppo.opsd_loss import compute_policy_loss_opsd
-                        policy_loss,opsd_metrics=compute_policy_loss_opsd(
-                            old_log_prob,log_prob,advantages,response_mask,config=self.config,
-                            teacher_log_probs=data['teacher_log_probs'].detach(),
-                            student_topk_log_probs=self._opsd_student_lp,
-                            teacher_topk_log_probs=data['opsd_teacher_lp'].detach())
-                        del self._opsd_student_lp
-                        metrics.update({'actor/opsd_'+key:value for key,value in opsd_metrics.items()})
-                        pg_loss=policy_loss
-
                     if separate_opd:
-                        selected_mask=response_mask * data.get("opd_token_mask",torch.ones_like(response_mask))
-                        if selected_mask.any():
-                            opd_loss, opd_clipfrac, _, _ = compute_policy_loss(
-                                old_log_prob=old_log_prob,log_prob=log_prob,
-                                advantages=data["teacher_advantages"].detach(),response_mask=selected_mask,
-                                cliprange=clip_ratio,cliprange_low=clip_ratio_low,
-                                cliprange_high=clip_ratio_high,clip_ratio_c=clip_ratio_c,
-                                loss_agg_mode=loss_agg_mode,sample_weights=sample_weights)
-                        else:
-                            opd_loss=log_prob.sum()*0
-                            opd_clipfrac=log_prob.new_zeros(())
-                        if "global_opd_response_tokens" in data:
-                            # Outer backward weights by original tokens / global original tokens.
-                            # Rescale only the teacher term to obtain its independent selected-token mean.
-                            factor=(selected_mask.sum()/response_mask.sum().clamp_min(1)
-                                    *data["global_minibatch_response_tokens"][0]/data["global_opd_response_tokens"][0])
-                            opd_loss=opd_loss*factor
-                        metrics["actor/opd_clipfrac"] = float(opd_clipfrac.detach())
+                        # Sampled-token reverse KL, gamma=0. Keep this term
+                        # outside PPO clipping of the separate GRPO objective.
+                        ratio = torch.exp(log_prob - old_log_prob)
+                        opd_loss = agg_loss(
+                            loss_mat=-ratio * data["teacher_advantages"].detach(),
+                            loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
+                            sample_weights=sample_weights)
                         policy_loss = policy_loss + self.config.opd_teacher_coefficient * opd_loss
                         dp_size = torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
                         opd_minibatch_loss += float(opd_loss.detach() * response_mask.sum() * dp_size
@@ -637,14 +494,7 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
-                    if memory_probe:
-                        actor_memory(self, 'before_backward', epoch, batch_idx, micro_index, data)
                     loss.backward()
-                    if memory_probe:
-                        actor_memory(self, 'after_backward', epoch, batch_idx, micro_index, data)
-                        # Release completed graphs before reclaiming inactive blocks.
-                        del entropy, log_prob, policy_loss, loss
-                        actor_memory(self, 'after_reclaim', epoch, batch_idx, micro_index, data, reclaim=True)
 
                     data = {
                         "actor/pg_loss": pg_loss.detach().item(),
@@ -655,11 +505,10 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()
-                if memory_probe:
-                    actor_memory(self, 'after_optimizer', epoch, batch_idx, micro_index, None,
-                                 extra={'grad_norm': float(grad_norm.detach())})
-                if shared_opsd:
-                    assert torch.isfinite(grad_norm),'Nonfinite shared OPSD gradient skipped an Adam update; fail closed'
+                if self.config.get("retrieval_privilege", False):
+                    from src.actor_recovery import actor_memory
+                    actor_memory(self, "after_optimizer", epoch, batch_idx, -1, None,
+                                 extra={"grad_norm": float(grad_norm.detach().item())})
                 data = {"actor/grad_norm": grad_norm.detach().item()}
                 if separate_opd:
                     # DataProto.concat retains rank-zero metadata. Publish the
