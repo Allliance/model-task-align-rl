@@ -338,12 +338,30 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
-        for micro_batch in micro_batches:
+        import time
+        call_started = time.time()
+        completed_rows = 0
+        for micro_index, micro_batch in enumerate(micro_batches, 1):
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
             log_probs_lst.append(log_probs)
+            completed_rows += len(micro_batch['responses'])
+            if os.environ.get('SYNLOGIC_RUN_ROOT') and os.environ.get('SYNLOGIC_ALLOCATION_ID') and os.environ.get('SYNLOGIC_ATTEMPT'):
+                # Publish only completed forward work, with no text or token IDs.
+                import json
+                from pathlib import Path
+                valid_tokens = int(micro_batch['attention_mask'].sum().item())
+                role = 'actor' if self.actor_optimizer is not None else 'reference'
+                target = Path(os.environ['SYNLOGIC_RUN_ROOT']) / f'inference-progress-{role}-rank{torch.distributed.get_rank()}.json'
+                progress = dict(epoch=time.time(), call_started=call_started, allocation_id=os.environ['SYNLOGIC_ALLOCATION_ID'],
+                                attempt=os.environ['SYNLOGIC_ATTEMPT'], role=role, rank=torch.distributed.get_rank(),
+                                completed_micro_batches=micro_index, total_micro_batches=len(micro_batches),
+                                completed_rows=completed_rows, total_rows=len(batch), last_valid_tokens=valid_tokens)
+                temporary = target.with_suffix('.tmp')
+                temporary.write_text(json.dumps(progress)+'\n')
+                temporary.replace(target)
             if calculate_entropy:
                 entropy_lst.append(entropy)
 
