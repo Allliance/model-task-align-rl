@@ -439,7 +439,7 @@ class DataParallelPPOActor(BasePPOActor):
                         # Plan execution using both contexts; optimization still
                         # receives original student masks and global token means.
                         work=mini_batch['attention_mask'].sum(-1)+mini_batch['opsd_privileged_attention_mask'].sum(-1)
-                        assert int(work.max())<=max_token_len,'One paired context exceeds the execution token budget'
+                        assert int(work.max())<=max_token_len, (f'One paired context exceeds the execution token budget: paired_max={int(work.max())}, budget={max_token_len}, actor_budget={self.config.ppo_max_token_len_per_gpu}, sp={self.ulysses_sequence_parallel_size}, student_max={int(mini_batch["attention_mask"].sum(-1).max())}, teacher_max={int(mini_batch["opsd_privileged_attention_mask"].sum(-1).max())}, student_width={mini_batch["attention_mask"].shape[-1]}, teacher_width={mini_batch["opsd_privileged_attention_mask"].shape[-1]}')
                         planner=mini_batch.clone()
                         planner['attention_mask']=torch.arange(int(work.max()),device=work.device)[None,:]<work[:,None]
                         minimum=None
