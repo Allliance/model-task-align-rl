@@ -482,7 +482,7 @@ class DataParallelPPOActor(BasePPOActor):
                 self.actor_optimizer.zero_grad()
                 opd_minibatch_loss = 0.0
 
-                for data in micro_batches:
+                for micro_index, data in enumerate(micro_batches):
                     # Support all hardwares
                     if isinstance(data, DataProto):
                         data = {**data.batch.to(get_device_id()), **data.non_tensor_batch}
@@ -524,7 +524,13 @@ class DataParallelPPOActor(BasePPOActor):
                         assert all(not value.requires_grad for value in targets.values())
                         data.update(targets)
                         metrics['actor/opsd_teacher_policy_version']=float(policy_version)
+                    memory_probe = (self.config.get('retrieval_privilege', False) and not oracle_opsd)
+                    if memory_probe:
+                        from src.actor_recovery import actor_memory
+                        actor_memory(self, 'before_student', epoch, batch_idx, micro_index, data, reclaim=True)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
+                    if memory_probe:
+                        actor_memory(self, 'after_student', epoch, batch_idx, micro_index, data)
 
                     if oracle_opsd:
                         # Direct FKL has no PPO objective, even as a discarded
@@ -631,7 +637,14 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
+                    if memory_probe:
+                        actor_memory(self, 'before_backward', epoch, batch_idx, micro_index, data)
                     loss.backward()
+                    if memory_probe:
+                        actor_memory(self, 'after_backward', epoch, batch_idx, micro_index, data)
+                        # Release completed graphs before reclaiming inactive blocks.
+                        del entropy, log_prob, policy_loss, loss
+                        actor_memory(self, 'after_reclaim', epoch, batch_idx, micro_index, data, reclaim=True)
 
                     data = {
                         "actor/pg_loss": pg_loss.detach().item(),
@@ -642,6 +655,9 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()
+                if memory_probe:
+                    actor_memory(self, 'after_optimizer', epoch, batch_idx, micro_index, None,
+                                 extra={'grad_norm': float(grad_norm.detach())})
                 if shared_opsd:
                     assert torch.isfinite(grad_norm),'Nonfinite shared OPSD gradient skipped an Adam update; fail closed'
                 data = {"actor/grad_norm": grad_norm.detach().item()}

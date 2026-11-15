@@ -203,7 +203,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                     # generate a batch
                     self._progress("generating")
                     with marked_timer("gen", timing_raw, "red"):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        from src.actor_recovery import generation_with_replay
+                        gen_batch_output = generation_with_replay(self, gen_batch)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
 
@@ -413,7 +414,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                         # update actor
                         self._progress("updating_actor")
                         with marked_timer("update_actor", timing_raw, "red"):
-                            actor_output = self.actor_rollout_wg.update_actor(self._actor_update_batch(batch))
+                            actor_batch = self._actor_update_batch(batch)
+                            from src.actor_recovery import capture_actor_batch
+                            capture_actor_batch(self, actor_batch)
+                            actor_output = self.actor_rollout_wg.update_actor(actor_batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
                         if any(isinstance(value, (int, float, np.number)) and not math.isfinite(float(value))
