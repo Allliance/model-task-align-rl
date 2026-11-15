@@ -225,7 +225,7 @@ def _true_reward_diagnostic(data_source, response_str, extra_info, score_type, s
             return None, False, False
         # Reuse an already-scored clean accuracy result, including failure flags.
         same_reference = original is None or original == extra_info.get("game_data_str")
-        if not noisy and same_reference and score_type == "acc_without_think_format":
+        if explicitly_clean and not noisy and same_reference and score_type == "acc_without_think_format":
             value, checked = float(score), scored_info
         else:
             shadow.pop("verifier_timed_out", None)
@@ -334,8 +334,9 @@ class SynLogicRewardManager:
             if (not data_item.non_tensor_batch[self.reward_fn_key].startswith("val/")
                     and self.score_type not in ("validation_acc", "math_validation_acc")):
                 existing = None
-                if len(reward_extra_info.get("diagnostic_true_verified", [])) > i:
-                    existing = {key: reward_extra_info["diagnostic_true_" + field][i]
+                if all(len(reward_extra_info.get("diagnostic_true_" + field, [])) > i
+                       for field in ("correct", "verified", "error")):
+                    existing = {key: reward_extra_info.get("diagnostic_true_" + field)[i]
                                 for key, field in [("correct", "correct"), ("verified", "verified"),
                                                    ("error", "error")]}
                 true_reward, true_verified, true_error = _true_reward_diagnostic(
