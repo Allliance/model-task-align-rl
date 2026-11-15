@@ -196,6 +196,9 @@ class RayDAPOTrainer(RayPPOTrainer):
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
+                if hasattr(self, '_prepare_generation'):
+                    self._prepare_generation(new_batch, gen_batch)
+
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     self._progress("generating")

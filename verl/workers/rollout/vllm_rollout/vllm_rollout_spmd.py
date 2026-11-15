@@ -287,9 +287,19 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            budgets=non_tensor_batch.pop('response_token_budget',None)
+            sampling_params=self.sampling_params
+            if budgets is not None:
+                assert len(budgets)==len(vllm_inputs) and not is_validate
+                sampling_params=[]
+                for budget in budgets:
+                    assert 0<int(budget)<=self.config.response_length
+                    params=deepcopy(self.sampling_params)
+                    params.max_tokens=int(budget)
+                    sampling_params.append(params)
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
+                sampling_params=sampling_params,
                 lora_request=lora_requests,
                 use_tqdm=False,
             )
@@ -299,9 +309,15 @@ class vLLMRollout(BaseRollout):
 
             response = []
             rollout_log_probs = []
-            for output in outputs:
+            generated_lengths=[]
+            assert len(outputs)==len(vllm_inputs)
+            for row,output in enumerate(outputs):
+                assert list(output.prompt_token_ids)==vllm_inputs[row]['prompt_token_ids'], 'vLLM changed prompt order'
+                assert len(output.outputs)==self.sampling_params.n
                 for sample_id in range(len(output.outputs)):
                     response_ids = output.outputs[sample_id].token_ids
+                    assert 0<len(response_ids)<=(int(budgets[row]) if budgets is not None else self.sampling_params.max_tokens)
+                    generated_lengths.append(len(response_ids))
                     response.append(response_ids)
                     curr_log_prob = []
                     for i, logprob in enumerate(output.outputs[sample_id].logprobs):
@@ -336,6 +352,14 @@ class vLLMRollout(BaseRollout):
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
         response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        if budgets is not None:
+            # A length-capped response need not end in EOS. Padding is never an
+            # emitted token, including when pad_token_id differs from eos_token_id.
+            lengths=torch.tensor(generated_lengths,device=response.device)
+            emitted=torch.arange(response_length,device=response.device)[None,:]<lengths[:,None]
+            response_attention_mask=response_attention_mask*emitted
+            assert torch.equal(response_attention_mask.sum(-1),lengths), 'Generated tokens after EOS would be discarded'
+            position_ids[..., -response_length:]*=(response_attention_mask.unsqueeze(1) if position_ids.dim()==3 else response_attention_mask)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid

@@ -96,6 +96,17 @@ class DataParallelPPOActor(BasePPOActor):
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
+            # Padded tensor width can exceed native context; only valid tokens
+            # and their positions constrain a packed/padded causal sequence.
+            unwrapped=self.actor_module
+            while not hasattr(unwrapped,'config'):
+                unwrapped=unwrapped.module if hasattr(unwrapped,'module') else unwrapped.model
+            model_config=unwrapped.config
+            native_limit=model_config.max_position_embeddings
+            valid=micro_batch['attention_mask'].bool()
+            assert (valid.sum(-1)<=native_limit).all(), 'Valid sequence exceeds native context'
+            if position_ids.dim()==2:
+                assert (position_ids[valid]<native_limit).all(), 'Valid position exceeds native context'
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
