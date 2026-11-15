@@ -383,6 +383,9 @@ class DataParallelPPOActor(BasePPOActor):
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
+        if torch.cuda.is_available():
+            # Release completed rollout/logprob workspaces before training.
+            torch.cuda.empty_cache()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
@@ -511,7 +514,13 @@ class DataParallelPPOActor(BasePPOActor):
                         calculate_entropy = True
                     if shared_opsd:
                         policy_version=(policy_outer_step-1)*len(dataloader)+epoch*len(dataloader)+batch_idx
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                         targets=self.shared_teacher_callback(data,temperature,policy_version)
+                        if torch.cuda.is_available():
+                            # The no-grad teacher's logits/workspaces are dead;
+                            # leave physical headroom for external BLAS kernels.
+                            torch.cuda.empty_cache()
                         assert all(not value.requires_grad for value in targets.values())
                         data.update(targets)
                         metrics['actor/opsd_teacher_policy_version']=float(policy_version)
