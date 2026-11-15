@@ -89,6 +89,26 @@ class TrueRewardTest(unittest.TestCase):
         self.assertEqual(reward._true_reward_diagnostic("test", "<answer>wrong</answer>",
             extra, "acc_without_think_format", 1., {}), (None, False, False))
 
+    def test_nonstandard_target_mode_cannot_reuse_assigned_score(self):
+        clean = reward.Data("question", "right").to_json_str()
+        extra = {"game_data": reward.Data.from_json_str(clean), "game_data_str": clean,
+                 "original_game_data_str": clean, "target_mode": "other_noise_mode"}
+        self.assertEqual(reward._true_reward_diagnostic("test", "<answer>wrong</answer>",
+            extra, "acc_without_think_format", 1., {}), (0., True, False))
+
+    @unittest.skipUnless(hasattr(reward, "mathador_true_correct"), "Legacy diagnostic branch only")
+    def test_manager_reuses_existing_native_diagnostic(self):
+        with patch.dict(reward.verifier_classes, {"mathador": LabelVerifier}), \
+             patch.object(reward, "mathador_true_correct", return_value=True) as native:
+            # Legacy original-reference verdict deliberately differs from a second
+            # generic label check, proving the new manager path reuses that verdict.
+            result = manager()(make_batch([11], noisy=True, source="mathador"), return_dict=True)
+        info = result["reward_extra_info"]
+        self.assertEqual(info["diagnostic_true_correct"], [True])
+        self.assertEqual(info["diagnostic_true_verified"], [True])
+        self.assertEqual(info["diagnostic_true_reward"], [1.])
+        self.assertEqual(native.call_count, 1)
+
     def test_unmarked_reference_is_unknown(self):
         extra = {"game_data": reward.Data("question", "wrong")}
         self.assertEqual(reward._true_reward_diagnostic("test", "<answer>wrong</answer>",
