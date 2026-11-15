@@ -247,6 +247,7 @@ class DataParallelPPOActor(BasePPOActor):
             return entropy, log_probs
 
     def _eopd_probabilities(self,logits,micro_batch,indices=None):
+        from torch.utils.checkpoint import checkpoint
         assert not self.use_ulysses_sp and not self.use_fused_kernels
         response_mask=micro_batch['attention_mask'][:,-micro_batch['responses'].shape[1]:].bool()
         b,r=response_mask.shape;s=micro_batch['input_ids'].shape[1]
@@ -255,15 +256,36 @@ class DataParallelPPOActor(BasePPOActor):
         if indices is not None:
             packed=torch.searchsorted(indices,positions)
             assert torch.equal(indices[packed],positions),'Response prediction positions absent from packed sequence'
-            selected=logits[packed]
-        else:selected=logits.reshape(-1,logits.shape[-1])[positions]
-        ids=micro_batch['eopd_teacher_ids'].reshape(-1,micro_batch['eopd_teacher_ids'].shape[-1])[valid].long()
-        z=selected.float();normalizer=torch.logsumexp(z,-1,keepdim=True);lp=z.gather(-1,ids)-normalizer
-        labels=micro_batch['responses'].flatten()[valid,None]
-        chosen=z.gather(-1,labels).squeeze(-1)-normalizer.squeeze(-1)
-        self._eopd_alignment_lp=chosen.detach()
-
-        output=lp.new_zeros((b*r,ids.shape[-1])).index_copy(0,valid.nonzero().flatten(),lp)
+            positions=packed
+        flat=logits.reshape(-1,logits.shape[-1])
+        # Alignment diagnostics do not participate in optimization. Bound their
+        # temporary FP32 vocabulary buffer and run only until alignment passes.
+        if not getattr(self,'_eopd_alignment_checked',False):
+            labels=micro_batch['responses'].flatten()[valid,None]
+            with torch.no_grad():
+                chosen=[]
+                for start in range(0,len(positions),128):
+                    z=flat[positions[start:start+128]].float()
+                    chosen.append(z.gather(-1,labels[start:start+128]).squeeze(-1)-torch.logsumexp(z,-1))
+                self._eopd_alignment_lp=torch.cat(chosen)
+        # The existing strict entropy gate makes FKL and its gradient exactly
+        # zero elsewhere. RKL still covers every original valid response token.
+        gated=micro_batch['eopd_teacher_entropy'].flatten()[valid]>.8
+        ids=micro_batch['eopd_teacher_ids'].reshape(b*r,-1)[valid][gated].long()
+        output=torch.zeros((b*r,micro_batch['eopd_teacher_ids'].shape[-1]),device=logits.device,dtype=torch.float32)
+        if gated.any():
+            selected=flat[positions[gated]]
+            def project(values,token_ids):
+                z=values.float()
+                return z.gather(-1,token_ids)-torch.logsumexp(z,-1,keepdim=True)
+            parts=[]
+            for start in range(0,len(selected),128):
+                values=selected[start:start+128];token_ids=ids[start:start+128]
+                if torch.is_grad_enabled() and values.requires_grad:
+                    part=checkpoint(project,values,token_ids,use_reentrant=False,preserve_rng_state=False)
+                else:part=project(values,token_ids)
+                parts.append(part)
+            output=output.index_copy(0,valid.nonzero().flatten()[gated],torch.cat(parts))
         return output.reshape(b,r,-1)
 
     def _optimizer_step(self):
