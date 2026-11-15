@@ -302,15 +302,27 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
-        for micro_batch in micro_batches:
+        reclaim_scoring = self.config.get('retrieval_privilege', False) and not use_dynamic_bsz
+        profile_once = reclaim_scoring and not getattr(self, '_scoring_memory_profiled', False)
+        for micro_index, micro_batch in enumerate(micro_batches):
+            if reclaim_scoring:
+                torch.cuda.empty_cache()
+            if profile_once:
+                from src.scoring_memory import record_scoring_memory
+                record_scoring_memory('before_forward', micro_index, micro_batch)
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
+            if profile_once:
+                record_scoring_memory('after_forward', micro_index, micro_batch)
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
 
+        if reclaim_scoring:
+            torch.cuda.empty_cache()
+        self._scoring_memory_profiled = True
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
