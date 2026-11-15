@@ -341,6 +341,9 @@ class DataParallelPPOActor(BasePPOActor):
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
+        if self.config.get('retrieval_privilege', False):
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
