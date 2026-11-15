@@ -642,9 +642,10 @@ def compute_policy_loss(
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
     sample_weights=None,
+    clip_policy: bool = True,
 ):
     """
-    Compute the clipped policy objective and related metrics for PPO.
+    Compute the policy objective, optionally retaining PPO and dual clipping.
 
     Adapted from
     https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
@@ -668,11 +669,11 @@ def compute_policy_loss(
         clip_ratio_c (float, optional):
             Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
             Defaults to 3.0.
+        clip_policy (bool):
+            Apply PPO and dual clipping. False keeps only the existing numerical log-ratio guard.
         loss_agg_mode (str, optional):
             Aggregation mode for `agg_loss`. Defaults to "token-mean".
     """
-    assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
-
     negative_approx_kl = log_prob - old_log_prob
     # Clamp negative_approx_kl for stability
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
@@ -680,6 +681,14 @@ def compute_policy_loss(
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     pg_losses1 = -advantages * ratio
+    if not clip_policy:
+        # Importance-ratio policy gradient without PPO or dual clipping.
+        pg_loss = agg_loss(loss_mat=pg_losses1, loss_mask=response_mask,
+                           loss_agg_mode=loss_agg_mode, sample_weights=sample_weights)
+        zero = log_prob.new_zeros(())
+        return pg_loss, zero, ppo_kl, zero
+
+    assert clip_ratio_c > 1.0, "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0," + f" but get the value: {clip_ratio_c}."
     if cliprange_low is None:
         cliprange_low = cliprange
     if cliprange_high is None:

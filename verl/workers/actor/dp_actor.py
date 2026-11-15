@@ -375,7 +375,7 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
-        metrics = {}
+        metrics = {"actor/ppo_clip_enabled": float(self.config.get("ppo_clip_enabled", True))}
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
@@ -438,6 +438,7 @@ class DataParallelPPOActor(BasePPOActor):
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
                         sample_weights=sample_weights,
+                        clip_policy=self.config.get("ppo_clip_enabled", True),
                     )
 
                     if entropy_coeff != 0:
@@ -457,7 +458,8 @@ class DataParallelPPOActor(BasePPOActor):
                                 advantages=data["teacher_advantages"].detach(),response_mask=selected_mask,
                                 cliprange=clip_ratio,cliprange_low=clip_ratio_low,
                                 cliprange_high=clip_ratio_high,clip_ratio_c=clip_ratio_c,
-                                loss_agg_mode=loss_agg_mode,sample_weights=sample_weights)
+                                loss_agg_mode=loss_agg_mode,sample_weights=sample_weights,
+                                clip_policy=self.config.get("ppo_clip_enabled", True))
                         else:
                             opd_loss=log_prob.sum()*0
                             opd_clipfrac=log_prob.new_zeros(())
