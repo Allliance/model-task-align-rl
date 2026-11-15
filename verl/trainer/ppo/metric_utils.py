@@ -91,8 +91,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
 
     Returns:
         A dictionary of metrics including:
-            - critic/score/mean, max, min: Statistics about sequence scores
-            - critic/rewards/mean, max, min: Statistics about sequence rewards
+            - critic/score/mean, max, min, std: Statistics about sequence scores
+            - critic/rewards/mean, max, min, std: Statistics about sequence rewards
+            - critic/true_reward/mean, max, min, std: Verified clean-label accuracy
             - critic/advantages/mean, max, min: Statistics about advantages
             - critic/returns/mean, max, min: Statistics about returns
             - critic/values/mean, max, min: Statistics about critic values (if use_critic=True)
@@ -131,10 +132,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "critic/score/mean": torch.mean(sequence_score).detach().item(),
         "critic/score/max": torch.max(sequence_score).detach().item(),
         "critic/score/min": torch.min(sequence_score).detach().item(),
+        "critic/score/std": torch.std(sequence_score.float(), unbiased=False).detach().item(),
         # reward
         "critic/rewards/mean": torch.mean(sequence_reward).detach().item(),
         "critic/rewards/max": torch.max(sequence_reward).detach().item(),
         "critic/rewards/min": torch.min(sequence_reward).detach().item(),
+        "critic/rewards/std": torch.std(sequence_reward.float(), unbiased=False).detach().item(),
         # adv
         "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
         "critic/advantages/max": torch.max(valid_adv).detach().item(),
@@ -166,6 +169,43 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+    metrics.update(compute_true_reward_metrics(batch.non_tensor_batch, len(sequence_score)))
+    return metrics
+
+
+def compute_true_reward_metrics(info, total):
+    """Per-response clean-label accuracy, with population std and explicit coverage.
+
+    Unverified/missing values are excluded from statistics, never filled with zero.
+    This reads detached diagnostic metadata and does not modify training tensors.
+    """
+    key = "diagnostic_true_reward"
+    if key not in info:
+        return {}
+    try:
+        values = np.asarray(info[key], dtype=float)
+        verified = np.asarray(info.get(key + "_verified", [False] * total), dtype=bool)
+        errors = np.asarray(info.get(key + "_error", [False] * total), dtype=bool)
+        if values.shape != (total,) or verified.shape != (total,) or errors.shape != (total,):
+            raise ValueError("Expected one diagnostic value per training response")
+    except (TypeError, ValueError) as error:
+        # Logging metadata must not terminate an otherwise healthy training run.
+        import logging
+        logging.getLogger(__name__).error("Skipping invalid true-reward diagnostics: %s", error)
+        return {"critic/true_reward/metadata_errors": 1}
+    valid = verified & ~errors & np.isfinite(values)
+    measured = values[valid]
+    prefix = "critic/true_reward/"
+    metrics = {prefix + "count": int(valid.sum()), prefix + "total": total,
+               prefix + "missing": int((~valid).sum()),
+               prefix + "verifier_errors": int(errors.sum())}
+    if total:
+        metrics[prefix + "coverage"] = float(valid.sum() / total)
+    if measured.size:
+        metrics.update({prefix + "mean": float(measured.mean()),
+                        prefix + "max": float(measured.max()),
+                        prefix + "min": float(measured.min()),
+                        prefix + "std": float(measured.std(ddof=0))})
     return metrics
 
 
