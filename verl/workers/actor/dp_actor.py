@@ -338,14 +338,26 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        # Shared-current retrieval keeps rollout, teacher and student phases on
+        # the same device. Release only inactive allocator blocks; leave the
+        # original scoring chunks, tensors and returned values unchanged.
+        reclaim_scoring = self.config.get('shared_current_opsd', False) and not use_dynamic_bsz
+        profile_once = reclaim_scoring and not getattr(self, '_scoring_memory_profiled', False)
         import time
         call_started = time.time()
         completed_rows = 0
         for micro_index, micro_batch in enumerate(micro_batches, 1):
+            if reclaim_scoring:
+                torch.cuda.empty_cache()
+            if profile_once:
+                from src.scoring_memory import record_scoring_memory
+                record_scoring_memory('before_forward', micro_index - 1, micro_batch)
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, calculate_entropy=calculate_entropy)
+            if profile_once:
+                record_scoring_memory('after_forward', micro_index - 1, micro_batch)
             log_probs_lst.append(log_probs)
             completed_rows += len(micro_batch['responses'])
             if os.environ.get('SYNLOGIC_RUN_ROOT') and os.environ.get('SYNLOGIC_ALLOCATION_ID') and os.environ.get('SYNLOGIC_ATTEMPT'):
@@ -365,6 +377,9 @@ class DataParallelPPOActor(BasePPOActor):
             if calculate_entropy:
                 entropy_lst.append(entropy)
 
+        if reclaim_scoring:
+            torch.cuda.empty_cache()
+        self._scoring_memory_profiled = True
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = None
         if calculate_entropy:
