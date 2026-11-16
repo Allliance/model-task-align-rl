@@ -214,7 +214,12 @@ def attach_advantages(records, batch):
                 for field in ['reference_question_id','reference_rollout_id','document_id']:
                     row['retrieval_'+field]=batch.non_tensor_batch['retrieval_'+field][i]
                 if batch.meta_info.get('shared_current_opsd'):
-                    row['optimization_objective']='current_shared_teacher_forward_kl_top100_plus_tail'
+                    if batch.meta_info.get('self_current_sampled_opd'):
+                        row['optimization_objective']='ppo_clipped_self_teacher_v2'
+                        row['advantages']=None
+                        row['advantages_source']='opsd_target_snapshots: exact chosen teacher LP, old LP and actual detached advantages, indexed by row-map/teacher policy version'
+                    else:
+                        row['optimization_objective']='current_shared_teacher_forward_kl_top100_plus_tail'
                     row['teacher_weight_version_rule']='same current actor immediately before each optimizer minibatch; targets stop-gradient; no EMA, lag or frozen shadow'
                     # Each original prompt group remains in one of five global
                     # optimizer minibatches, before rank-major DP permutation.

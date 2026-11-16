@@ -96,6 +96,17 @@ class DataParallelPPOActor(BasePPOActor):
             batch_size, seqlen = input_ids.shape
             attention_mask = micro_batch["attention_mask"]
             position_ids = micro_batch["position_ids"]
+            # Padded tensor width can exceed native context; only valid tokens
+            # and their positions constrain a packed/padded causal sequence.
+            unwrapped=self.actor_module
+            while not hasattr(unwrapped,'config'):
+                unwrapped=unwrapped.module if hasattr(unwrapped,'module') else unwrapped.model
+            model_config=unwrapped.config
+            native_limit=model_config.max_position_embeddings
+            valid=micro_batch['attention_mask'].bool()
+            assert (valid.sum(-1)<=native_limit).all(), 'Valid sequence exceeds native context'
+            if position_ids.dim()==2:
+                assert (position_ids[valid]<native_limit).all(), 'Valid position exceeds native context'
             entropy = None
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
@@ -349,6 +360,14 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        self_opd = self.config.get('self_current_sampled_opd', False)
+        if self_opd:
+            assert self.config.opd_loss_mode == 'ppo_clipped_teacher'
+            assert data.meta_info['self_current_sampled_opd'] and hasattr(self, 'self_teacher_callback')
+            assert not self.config.use_kl_loss and self.config.entropy_coeff == 0
+            select_keys += ['opsd_privileged_' + key for key in ['prompts', 'input_ids', 'attention_mask', 'position_ids']]
+            select_keys += [key for key in ['opsd_capture_targets', 'opsd_snapshot_row_index', 'opsd_teacher_policy_version', 'self_opd_noisy', 'self_opd_group'] if key in data.batch]
+            policy_outer_step = int(data.meta_info['opsd_policy_outer_step'])
         separate_opd = self.config.get("opd_loss_mode") == "importance_sampling"
         if separate_opd:
             if (data.meta_info.get("opd_loss_mode") != "importance_sampling"
@@ -388,11 +407,21 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
+        if self_opd:
+            assert self.config.ppo_epochs == 1 and len(dataloader) == 5
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
                 # split batch into micro_batches
                 mini_batch = data
+                if self_opd:
+                    self.actor_optimizer.zero_grad()
+                    version = (policy_outer_step - 1) * len(dataloader) + batch_idx
+                    # The detached privileged pass finishes before any backward.
+                    # Student packing and the PPO loss below stay baseline-native.
+                    mini_batch, teacher_metrics = self.self_teacher_callback(mini_batch, temperature, version)
+                    metrics.update(teacher_metrics)
+                    data = mini_batch
                 if has_multi_modal_inputs:
                     self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
@@ -520,6 +549,8 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()
+                if self_opd:
+                    assert torch.isfinite(grad_norm), 'Self OPD nonfinite gradient; fail closed'
                 if self.config.get("retrieval_privilege", False):
                     from src.actor_recovery import actor_memory
                     actor_memory(self, "after_optimizer", epoch, batch_idx, -1, None,
