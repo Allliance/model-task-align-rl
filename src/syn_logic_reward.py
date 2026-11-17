@@ -194,6 +194,58 @@ def _preprocess_game_data(game_data_str):
     return Data.from_json_str(game_data_str)
         
 
+def _true_reward_diagnostic(data_source, response_str, extra_info, score_type, score,
+                            scored_info, existing=None):
+    """Return clean-reference accuracy and coverage; never an optimization reward."""
+    import copy
+    import math
+
+    existing = existing or {}
+    if existing.get("verified") or existing.get("error"):
+        verified = (bool(existing.get("verified")) and not bool(existing.get("error"))
+                    and existing.get("correct") is not None)
+        return (float(bool(existing["correct"])) if verified else None,
+                verified, bool(existing.get("error")))
+    if not extra_info:
+        return None, False, False
+    original = extra_info.get("original_game_data_str")
+    noisy = bool(extra_info.get("diagnostic_is_noisy") or
+                 extra_info.get("target_mode") == "fixed_wrong_answer")
+    noise_flag = extra_info.get("diagnostic_is_noisy")
+    explicitly_clean = (extra_info.get("target_mode") == "original_verifier"
+                        and noise_flag is not None and not bool(noise_flag))
+    if original is None and (noisy or not explicitly_clean):
+        return None, False, False
+    try:
+        shadow = copy.deepcopy(extra_info)
+        if original is not None:
+            shadow["game_data"] = _preprocess_game_data(original)
+            shadow["game_data_str"] = original
+        if "game_data" not in shadow:
+            return None, False, False
+        # Reuse an already-scored clean accuracy result, including failure flags.
+        same_reference = original is None or original == extra_info.get("game_data_str")
+        if explicitly_clean and not noisy and same_reference and score_type == "acc_without_think_format":
+            value, checked = float(score), scored_info
+        else:
+            shadow.pop("verifier_timed_out", None)
+            shadow.pop("verifier_unverified", None)
+            shadow["target_mode"] = "original_verifier"
+            shadow["diagnostic_is_noisy"] = False
+            shadow.pop("assigned_answer_key", None)
+            shadow.pop("diagnostic_assigned_answer_key", None)
+            value = float(compute_score_wo_think_format(
+                data_source, response_str, shadow["game_data"].answer, shadow))
+            checked = shadow
+        error = bool(checked.get("verifier_timed_out") or checked.get("verifier_unverified"))
+        if error or not math.isfinite(value):
+            return None, False, True
+        return float(value > 0), True, False
+    except Exception:
+        # A failed diagnostic is unknown, not an incorrect response.
+        return None, False, True
+
+
 class SynLogicRewardManager:
     """The SynLogic reward manager."""
     def __init__(
@@ -261,11 +313,12 @@ class SynLogicRewardManager:
             
             import copy
 
+            scored_info = copy.deepcopy(extra_info)
             result = self.compute_score(
                 data_source=data_source,
                 solution_str=response_str,
                 ground_truth=ground_truth,
-                extra_info=copy.deepcopy(extra_info),
+                extra_info=scored_info,
             )
 
             score: float
@@ -277,6 +330,23 @@ class SynLogicRewardManager:
             else:
                 score = result
                 
+            # Training-only, per-response diagnostic; validation protocol is unchanged.
+            if (not data_item.non_tensor_batch[self.reward_fn_key].startswith("val/")
+                    and self.score_type not in ("validation_acc", "math_validation_acc")):
+                existing = None
+                if all(len(reward_extra_info.get("diagnostic_true_" + field, [])) > i
+                       for field in ("correct", "verified", "error")):
+                    existing = {key: reward_extra_info.get("diagnostic_true_" + field)[i]
+                                for key, field in [("correct", "correct"), ("verified", "verified"),
+                                                   ("error", "error")]}
+                true_reward, true_verified, true_error = _true_reward_diagnostic(
+                    data_source, response_str, extra_info, self.score_type, score,
+                    scored_info, existing)
+                for key, value in [("diagnostic_true_reward", true_reward),
+                                   ("diagnostic_true_reward_verified", true_verified),
+                                   ("diagnostic_true_reward_error", true_error)]:
+                    reward_extra_info[key].append(value)
+
             reward = score
 
             if self.overlong_buffer_cfg.enable:
