@@ -6,6 +6,8 @@ class GameOf24Verifier(Verifier):
     """
     Verifier for Game of 24
     """
+    SCORING_VERSION = "mathador-target-v2"
+
     def verify(self, data: Data, test_solution: str):
         try:
             test_answer = self.extract_answer(test_solution)
@@ -40,9 +42,9 @@ class GameOf24Verifier(Verifier):
                 print("The number of numbers in the answer is not equal to the number of input numbers:", len(answer_numbers), len(input_numbers))
                 return False
             print("Test answer:", test_answer)
-            result = eval(test_answer)
+            answer_result = eval(test_answer)
             
-            return abs(result - result) < 1e-10  # Allow for floating-point precision
+            return abs(answer_result - result) < 1e-10  # Allow for floating-point precision
         except:
             return False
         
