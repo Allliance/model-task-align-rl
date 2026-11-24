@@ -814,10 +814,27 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        if os.environ.get("SYNLOGIC_RUN_ROOT"):
+            import zipfile
+            world_size = self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes
+            required = ["data.pt"] + [
+                f"actor/{kind}_world_size_{world_size}_rank_{rank}.pt"
+                for rank in range(world_size) for kind in ("model", "optim", "extra_state")
+            ]
+            if any(not zipfile.is_zipfile(os.path.join(local_global_step_folder, name)) for name in required):
+                raise RuntimeError("Full-state checkpoint archives are incomplete; recovery pointer preserved")
+
+        # Publish completeness before the recovery pointer. Both are atomic.
+        complete_path = os.path.join(local_global_step_folder, "complete.json")
+        with open(complete_path + ".tmp", "w") as f:
+            json.dump({"step": self.global_steps}, f)
+        os.replace(complete_path + ".tmp", complete_path)
+
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
-        with open(local_latest_checkpointed_iteration, "w") as f:
+        with open(local_latest_checkpointed_iteration + ".tmp", "w") as f:
             f.write(str(self.global_steps))
+        os.replace(local_latest_checkpointed_iteration + ".tmp", local_latest_checkpointed_iteration)
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":

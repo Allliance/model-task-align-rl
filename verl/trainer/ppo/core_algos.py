@@ -587,7 +587,7 @@ def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     return token_level_scores - kl * kl_ratio
 
 
-def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str):
+def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str, sample_weights=None):
     """
     Aggregate the loss matrix into a scalar.
 
@@ -602,6 +602,14 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
         loss: `a scalar torch.Tensor`
             aggregated loss
     """
+    if sample_weights is not None:
+        if sample_weights.shape != loss_mat.shape[:1]:
+            raise ValueError("Expected one fixed loss weight per response")
+        if not torch.isfinite(sample_weights).all() or (sample_weights < 0).any():
+            raise ValueError("Loss weights must be finite and nonnegative")
+        # Keep the original denominator: normalizing by observed weight would
+        # cancel the intended scaling when a microbatch contains one pool.
+        loss_mat = loss_mat * sample_weights.detach().to(loss_mat)[:, None]
     if loss_agg_mode == "token-mean":
         loss = verl_F.masked_mean(loss_mat, loss_mask)
     elif loss_agg_mode == "seq-mean-token-sum":
@@ -633,6 +641,7 @@ def compute_policy_loss(
     cliprange_high=None,
     clip_ratio_c=3.0,
     loss_agg_mode: str = "token-mean",
+    sample_weights=None,
 ):
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -684,9 +693,56 @@ def compute_policy_loss(
     pg_clipfrac_lower = verl_F.masked_mean(torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask)
 
     pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
-    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode,
+                       sample_weights=sample_weights)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+SEPARATE_OPD_LOSS_MODES = ("importance_sampling", "tip_ppo")
+
+
+def compute_opd_importance_sampling_loss(log_prob, old_log_prob, teacher_advantages, response_mask,
+                                         loss_agg_mode, sample_weights=None):
+    """Native separate OPD: sampled-token reverse KL, gamma=0, outside PPO clipping."""
+    ratio = torch.exp(log_prob - old_log_prob)
+    return agg_loss(loss_mat=-ratio * teacher_advantages.detach(), loss_mask=response_mask,
+                    loss_agg_mode=loss_agg_mode, sample_weights=sample_weights)
+
+
+def compute_tip_ppo_loss(log_prob, old_log_prob, teacher_advantages, response_mask, opd_token_mask,
+                         global_minibatch_response_tokens, global_opd_response_tokens,
+                         cliprange, cliprange_low, cliprange_high, clip_ratio_c,
+                         loss_agg_mode="token-mean", sample_weights=None):
+    """TIP selected-token teacher loss: dual-clip PPO on the selected tokens only.
+
+    The caller multiplies every microbatch loss by local response tokens * DP size /
+    global minibatch response tokens. This rescaling makes the teacher term an
+    independent mean over the optimizer minibatch's globally selected tokens.
+    Returns ``(loss, clipfrac)``; a microbatch without selected tokens contributes
+    an exact finite zero.
+    """
+    if loss_agg_mode != "token-mean":
+        raise ValueError("TIP selected-token normalization requires token-mean")
+    for name, counts in (("global_minibatch_response_tokens", global_minibatch_response_tokens),
+                         ("global_opd_response_tokens", global_opd_response_tokens)):
+        if not torch.all(counts == counts[0]):
+            raise ValueError(f"Mixed optimizer minibatches in a microbatch ({name})")
+    selected_mask = response_mask * opd_token_mask.to(response_mask.dtype)
+    local_selected = selected_mask.sum()
+    global_selected = global_opd_response_tokens[0]
+    if global_selected < 0 or local_selected > global_selected:
+        raise ValueError("Local selected teacher tokens exceed the global selected count")
+    zero = torch.zeros((), dtype=log_prob.dtype, device=log_prob.device)
+    if local_selected == 0:
+        return zero, zero
+    opd_loss, opd_clipfrac, _, _ = compute_policy_loss(
+        old_log_prob=old_log_prob, log_prob=log_prob, advantages=teacher_advantages.detach(),
+        response_mask=selected_mask, cliprange=cliprange, cliprange_low=cliprange_low,
+        cliprange_high=cliprange_high, clip_ratio_c=clip_ratio_c, loss_agg_mode=loss_agg_mode,
+        sample_weights=sample_weights)
+    factor = local_selected / response_mask.sum() * global_minibatch_response_tokens[0] / global_selected
+    return opd_loss * factor, opd_clipfrac
 
 
 def compute_entropy_loss(logits, response_mask, loss_agg_mode: str = "token-mean"):

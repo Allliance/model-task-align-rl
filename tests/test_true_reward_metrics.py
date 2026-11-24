@@ -96,18 +96,74 @@ class TrueRewardTest(unittest.TestCase):
         self.assertEqual(reward._true_reward_diagnostic("test", "<answer>wrong</answer>",
             extra, "acc_without_think_format", 1., {}), (0., True, False))
 
-    @unittest.skipUnless(hasattr(reward, "mathador_true_correct"), "Legacy diagnostic branch only")
-    def test_manager_reuses_existing_native_diagnostic(self):
-        with patch.dict(reward.verifier_classes, {"mathador": LabelVerifier}), \
-             patch.object(reward, "mathador_true_correct", return_value=True) as native:
-            # Legacy original-reference verdict deliberately differs from a second
-            # generic label check, proving the new manager path reuses that verdict.
-            result = manager()(make_batch([11], noisy=True, source="mathador"), return_dict=True)
+    def test_manager_reuses_one_canonical_clean_verdict(self):
+        native = reward.compute_score_wo_think_format
+        with patch.object(reward, "compute_score_wo_think_format", side_effect=native) as scorer:
+            result = manager()(make_batch([10], noisy=True), return_dict=True)
         info = result["reward_extra_info"]
         self.assertEqual(info["diagnostic_true_correct"], [True])
         self.assertEqual(info["diagnostic_true_verified"], [True])
         self.assertEqual(info["diagnostic_true_reward"], [1.])
-        self.assertEqual(native.call_count, 1)
+        self.assertEqual(info["diagnostic_true_reward_verified"], [True])
+        # One clean-reference verdict; the fixed target never calls the native scorer.
+        self.assertEqual(scorer.call_count, 1)
+
+    def test_clean_verdict_errors_are_unknown_in_both_metric_families(self):
+        with patch.object(LabelVerifier, "verify", side_effect=KeyError("malformed")):
+            result = manager()(make_batch([10], noisy=True), return_dict=True)
+        info = result["reward_extra_info"]
+        self.assertEqual(info["diagnostic_true_correct"], [None])
+        self.assertEqual(info["diagnostic_true_error"], [True])
+        self.assertEqual(info["diagnostic_true_reward"], [None])
+        self.assertEqual(info["diagnostic_true_reward_error"], [True])
+        self.assertEqual(result["reward_tensor"].sum(-1).tolist(), [0.])
+
+    def test_mathador_diagnostic_uses_fixed_native_verifier(self):
+        # setUp only adds the "test" task; "mathador" is the real task2verifier entry.
+        self.assertEqual(reward.verifier_classes["mathador"].__name__, "GameOf24Verifier")
+        clean = reward.Data("question", "unused stored expression", metadata={
+            "numbers": [1, 2, 3, 4], "operators": ["+", "-", "*", "/"], "result": 24}).to_json_str()
+        extra = dict(game_data_str=clean, original_game_data_str=clean, target_mode="fixed_wrong_answer",
+                     assigned_answer_key="1+2+3+4", diagnostic_is_noisy=True)
+        verdicts = {expression: reward._frozen_target_diagnostics(
+                        "mathador", f"<answer>```python {expression}```</answer>", "", extra)
+                    for expression in ("1*2*3*4", "1+2+3+4")}
+        self.assertEqual(verdicts["1*2*3*4"]["diagnostic_true_correct"], True)
+        self.assertEqual(verdicts["1+2+3+4"]["diagnostic_true_correct"], False)
+        self.assertTrue(all(v["diagnostic_true_verified"] for v in verdicts.values()))
+        self.assertEqual(reward.scoring_versions().get("mathador"), "mathador-target-v2")
+
+    def test_validation_ignores_training_target_metadata(self):
+        # Validation always scores against the native reference, even if a row
+        # carries fixed-label training metadata.
+        batch = make_batch([10, 11], noisy=True, source="val/test")
+        for extra in batch.non_tensor_batch["extra_info"]:
+            extra["game_data_str"] = extra["original_game_data_str"]
+        validation = reward.SynLogicRewardManager(Tokenizer(), 0, "validation_acc",
+            max_resp_len=10, overlong_buffer_cfg=SimpleNamespace(enable=False))
+        result = validation(batch, return_dict=True)
+        self.assertEqual(result["reward_tensor"].sum(-1).tolist(), [1., 0.])
+        self.assertIs(reward._SynLogic_Scores["validation_acc"], reward.compute_score_wo_think_format)
+
+    def test_native_parser_and_failure_semantics_are_unchanged(self):
+        extra = {"game_data": reward.Data("question", "right")}
+        score = lambda text: reward.compute_score_wo_think_format("test", text, "", dict(extra))
+        self.assertEqual(score("<answer>right</answer>"), 1.)
+        # First single-line match only, no stripping, no multi-line answers.
+        self.assertEqual(score("<answer>right</answer><answer>wrong</answer>"), 1.)
+        self.assertEqual(score("<answer>wrong</answer><answer>right</answer>"), 0.)
+        self.assertEqual(score("<answer> right </answer>"), 0.)
+        self.assertEqual(score("<answer>\nright</answer>"), 0.)
+        # Native verifier exceptions still propagate; no deadline or failure flags.
+        with patch.object(LabelVerifier, "verify", side_effect=KeyError("malformed")):
+            with self.assertRaises(KeyError):
+                score("<answer>right</answer>")
+        with patch.object(reward, "verifier_deadline", side_effect=AssertionError):
+            self.assertEqual(score("<answer>right</answer>"), 1.)
+        self.assertEqual(reward.compute_think_format_score(
+            "test", "<think>a\nb</think><answer>right</answer>", ""), 0.)
+        self.assertEqual(reward.compute_think_format_score(
+            "test", "<think>ab</think> <answer>right</answer>", ""), 1.)
 
     def test_unmarked_reference_is_unknown(self):
         extra = {"game_data": reward.Data("question", "wrong")}
