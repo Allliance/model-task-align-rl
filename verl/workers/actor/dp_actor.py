@@ -28,7 +28,14 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    SEPARATE_OPD_LOSS_MODES,
+    agg_loss,
+    compute_opd_importance_sampling_loss,
+    compute_policy_loss,
+    compute_tip_ppo_loss,
+    kl_penalty,
+)
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -48,6 +55,33 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def check_separate_opd_objective(config, meta_info, batch_keys):
+    """Return the actor's separate OPD mode after checking it against the trainer batch.
+
+    ``importance_sampling`` is the native unclipped sampled reverse-KL objective.
+    ``tip_ppo`` is TIP's selected-token PPO teacher objective. Token masks are
+    accepted only in ``tip_ppo``; no mode silently reinterprets another.
+    """
+    mode = config.get("opd_loss_mode")
+    requested = meta_info.get("opd_loss_mode")
+    batch_keys = set(batch_keys)
+    if mode in SEPARATE_OPD_LOSS_MODES:
+        if (requested != mode
+                or meta_info.get("opd_teacher_coefficient") != config.opd_teacher_coefficient
+                or meta_info.get("opd_outcome_coefficient") != config.opd_outcome_coefficient
+                or "global_minibatch_response_tokens" not in batch_keys):
+            raise ValueError("Actor OPD objective differs from the checked trainer objective")
+    elif requested in SEPARATE_OPD_LOSS_MODES:
+        raise ValueError("Trainer requested separate OPD " + str(requested) + " but actor mode differs")
+    tip_keys = {"opd_token_mask", "global_opd_response_tokens"} & batch_keys
+    if mode == "tip_ppo":
+        if len(tip_keys) != 2:
+            raise ValueError("tip_ppo requires opd_token_mask and global_opd_response_tokens")
+    elif tip_keys:
+        raise ValueError("Teacher token masks require opd_loss_mode=tip_ppo")
+    return mode if mode in SEPARATE_OPD_LOSS_MODES else None
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -334,6 +368,24 @@ class DataParallelPPOActor(BasePPOActor):
         multi_turn = data.meta_info.get("multi_turn", False)
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        opd_mode = check_separate_opd_objective(self.config, data.meta_info, data.batch.keys())
+        separate_opd = opd_mode is not None
+        if separate_opd:
+            select_keys += ["teacher_advantages", "outcome_advantages"]
+        if opd_mode == "tip_ppo":
+            select_keys += ["opd_token_mask", "global_opd_response_tokens"]
+        if "legacy_global_minibatch_rows" in data.batch:
+            if separate_opd or "global_minibatch_response_tokens" in data.batch:
+                raise ValueError("Legacy and global token normalization are mutually exclusive")
+            if "sample_weights" not in data.batch:
+                raise ValueError("Legacy microbatch preservation requires original loss weights")
+            if self.config.loss_agg_mode != "token-mean":
+                raise ValueError("Legacy microbatch preservation requires token-mean")
+            select_keys.append("legacy_global_minibatch_rows")
+        if "global_minibatch_response_tokens" in data.batch:
+            select_keys.append("global_minibatch_response_tokens")
+        if "sample_weights" in data.batch:
+            select_keys.append("sample_weights")
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
@@ -368,6 +420,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+                opd_minibatch_loss = 0.0
 
                 for data in micro_batches:
                     # Support all hardwares
@@ -384,7 +437,9 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = attention_mask[:, -response_length:]
 
                     old_log_prob = data["old_log_probs"]
-                    advantages = data["advantages"]
+                    advantages = (data["outcome_advantages"] * self.config.opd_outcome_coefficient
+                                  if separate_opd else data["advantages"])
+                    sample_weights = data.get("sample_weights")
 
                     clip_ratio = self.config.clip_ratio
                     clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
@@ -409,27 +464,67 @@ class DataParallelPPOActor(BasePPOActor):
                         cliprange_high=clip_ratio_high,
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
+                        sample_weights=sample_weights,
                     )
 
                     if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask,
+                                                loss_agg_mode=loss_agg_mode, sample_weights=sample_weights)
 
                         # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
 
+                    if opd_mode == "importance_sampling":
+                        # Sampled-token reverse KL, gamma=0. Keep this term
+                        # outside PPO clipping of the separate GRPO objective.
+                        opd_loss = compute_opd_importance_sampling_loss(
+                            log_prob, old_log_prob, data["teacher_advantages"], response_mask,
+                            loss_agg_mode, sample_weights=sample_weights)
+                    elif opd_mode == "tip_ppo":
+                        opd_loss, opd_clipfrac = compute_tip_ppo_loss(
+                            log_prob, old_log_prob, data["teacher_advantages"], response_mask,
+                            data["opd_token_mask"], data["global_minibatch_response_tokens"],
+                            data["global_opd_response_tokens"], clip_ratio, clip_ratio_low,
+                            clip_ratio_high, clip_ratio_c, loss_agg_mode, sample_weights=sample_weights)
+                        metrics["actor/opd_clipfrac"] = float(opd_clipfrac.detach())
+                    if separate_opd:
+                        policy_loss = policy_loss + self.config.opd_teacher_coefficient * opd_loss
+                        dp_size = torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+                        opd_minibatch_loss += float(opd_loss.detach() * response_mask.sum() * dp_size
+                                                    / data["global_minibatch_response_tokens"][0])
+                        metrics["actor/opd_teacher_coefficient"] = self.config.opd_teacher_coefficient
+
                     if self.config.use_kl_loss:
                         ref_log_prob = data["ref_log_prob"]
                         # compute kl loss
                         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask,
+                                           loss_agg_mode=loss_agg_mode, sample_weights=sample_weights)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
                         metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                    if self.config.use_dynamic_bsz:
+                    if "legacy_global_minibatch_rows" in data:
+                        # sample_weights encode the original SP microbatch's
+                        # rows/tokens ratio. Preserve that existing objective
+                        # while distributing its same minibatches across DP.
+                        denominator = data["legacy_global_minibatch_rows"][0]
+                        if not torch.all(data["legacy_global_minibatch_rows"] == denominator):
+                            raise ValueError("Mixed legacy optimizer minibatches in a microbatch")
+                        dp_size = torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+                        loss = policy_loss * response_mask.sum() * dp_size / denominator
+                    elif "global_minibatch_response_tokens" in data:
+                        if loss_agg_mode != "token-mean":
+                            raise ValueError("Global response-token normalization requires token-mean")
+                        denominator = data["global_minibatch_response_tokens"][0]
+                        if not torch.all(data["global_minibatch_response_tokens"] == denominator):
+                            raise ValueError("Mixed optimizer minibatches in a microbatch")
+                        dp_size = torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+                        loss = policy_loss * response_mask.sum() * dp_size / denominator
+                    elif self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
@@ -446,6 +541,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
+                if separate_opd:
+                    # DataProto.concat retains rank-zero metadata. Publish the
+                    # actual global loss rather than rank zero's DP-scaled share.
+                    reported = torch.tensor(opd_minibatch_loss, device=get_device_id())
+                    torch.distributed.all_reduce(reported)
+                    reported /= torch.distributed.get_world_size()
+                    data["actor/opd_loss"] = reported.item()
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
         return metrics

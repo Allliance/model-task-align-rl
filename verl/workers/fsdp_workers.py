@@ -308,9 +308,10 @@ class ActorRolloutRefWorker(Worker, WorkerProfilerExtension):
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
         # TODO: add transformer policy
-        # We force reference policy to use CPUOffload to save memory.
-        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
-        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+        # Reference CPU offload defaults on, but can be disabled with measured GPU headroom.
+        # Actor CPUOffload stays off because it breaks gradient accumulation.
+        offload_reference_params = role != "actor" and fsdp_config.get("cpu_offload", True)
+        cpu_offload = CPUOffload(offload_params=True) if offload_reference_params else None
         fsdp_strategy = self.config.actor.strategy
         if fsdp_strategy == "fsdp":
             actor_module_fsdp = FSDP(
@@ -334,7 +335,7 @@ class ActorRolloutRefWorker(Worker, WorkerProfilerExtension):
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
             else:
-                cpu_offload = None if role == "actor" else CPUOffloadPolicy(pin_memory=True)
+                cpu_offload = CPUOffloadPolicy(pin_memory=True) if offload_reference_params else None
 
             fsdp_kwargs = {
                 "mesh": fsdp_mesh,
@@ -437,6 +438,7 @@ class ActorRolloutRefWorker(Worker, WorkerProfilerExtension):
                 offload_param=self._is_offload_param,
                 load_format=self.config.rollout.load_format,
                 layered_summon=self.config.rollout.get("layered_summon", False),
+                enable_sleep_mode=self.config.rollout.get("enable_sleep_mode", True),
             )
             log_gpu_memory_usage("After building sharding manager", logger=logger)
 

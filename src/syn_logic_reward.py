@@ -2,14 +2,22 @@ import re
 import sys
 sys.path = sys.path + ["SynLogic"]
 import random
+import contextlib
+import copy
+import os
 from task2verifier import verifier_classes
 
 from collections import defaultdict
 import torch
 from verl import DataProto
+from .fixed_labels import answer_key, extract_answer
 
 
 import json
+
+
+from .task_deadline import task_deadline as verifier_deadline, TaskDeadlineExceeded
+
 
 class Data:
     """
@@ -71,9 +79,10 @@ def _extract_answer(solution_str):
 
 
 def compute_score_wo_think_format(data_source, solution_str, ground_truth, extra_info=None):
+    # Native-reference scorer shared by validation and ordinary training rows.
     if data_source == "deepscaler":
         return compute_math_score_wo_think_format(data_source, solution_str, ground_truth, extra_info)
-    
+
     verifier = verifier_classes[data_source]()
     game_data = extra_info["game_data"]
     try:
@@ -83,6 +92,54 @@ def compute_score_wo_think_format(data_source, solution_str, ground_truth, extra
     else:
         score = float(verifier.verify(game_data, solution))
     return score
+
+
+def compute_fixed_label_score_wo_think_format(data_source, solution_str, ground_truth, extra_info=None):
+    """Historical, explicit, training-only ``fixed_wrong_answer`` target mode.
+
+    A frozen assigned target changes the answer key, never the reward sign; some
+    native constraint checkers ignore Data.answer altogether. Parser, deadline
+    and failure flags are those recorded for this mode. Validation never routes here.
+    """
+    extra_info.pop("verifier_timed_out", None)
+    extra_info.pop("verifier_unverified", None)
+    verifier = verifier_classes[data_source]()
+    solution = extract_answer(solution_str)
+    if solution is None:
+        return 0.0
+    try:
+        with verifier_deadline(), open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            score = float(answer_key(solution, verifier) == extra_info["assigned_answer_key"])
+    except TaskDeadlineExceeded:
+        extra_info["verifier_timed_out"] = True
+        score = 0.0
+    except Exception:
+        extra_info["verifier_unverified"] = True
+        score = 0.0
+    return score
+
+
+def _uses_fixed_label_target(data_source, extra_info):
+    return (data_source != "deepscaler" and extra_info is not None
+            and extra_info.get("target_mode") == "fixed_wrong_answer")
+
+
+def compute_training_score_wo_think_format(data_source, solution_str, ground_truth, extra_info=None):
+    """Training accuracy: the native scorer unless the row explicitly opts into fixed labels."""
+    if _uses_fixed_label_target(data_source, extra_info):
+        return compute_fixed_label_score_wo_think_format(data_source, solution_str, ground_truth, extra_info)
+    return compute_score_wo_think_format(data_source, solution_str, ground_truth, extra_info)
+
+
+def _fixed_label_scoring_failed(extra_info):
+    # Only the fixed-label path sets these flags; native failures propagate unchanged.
+    return bool(extra_info) and bool(extra_info.get("verifier_timed_out") or extra_info.get("verifier_unverified"))
+
+
+def scoring_versions():
+    """Versioned native scorer repairs, for new provenance and snapshots only."""
+    return {task: cls.SCORING_VERSION for task, cls in sorted(verifier_classes.items())
+            if getattr(cls, "SCORING_VERSION", None)}
 
 
 def compute_math_score_wo_think_format(data_source, solution_str, ground_truth, extra_info=None):
@@ -103,11 +160,11 @@ def compute_think_format_score(data_source, solution_str, ground_truth, extra_in
         else:
             return 0.0
     return check_format(solution_str.strip())
-    
+
 
 def compute_score_w_think_format_score(data_source, solution_str, ground_truth, extra_info=None):
     format_reward = compute_think_format_score(data_source, solution_str, ground_truth, extra_info)
-    accuracy_reward = compute_score_wo_think_format(data_source, solution_str, ground_truth, extra_info)
+    accuracy_reward = compute_training_score_wo_think_format(data_source, solution_str, ground_truth, extra_info)
     
     return {
         "format_reward": format_reward,
@@ -141,12 +198,14 @@ def random_score_with_format(data_source, solution_str, ground_truth, extra_info
 
 def incorrect_format_score(data_source, solution_str, ground_truth, extra_info=None):
     format_reward = compute_think_format_score(data_source, solution_str, ground_truth, extra_info)
-    accuracy_reward = compute_score_wo_think_format(data_source, solution_str, ground_truth, extra_info)
+    accuracy_reward = compute_training_score_wo_think_format(data_source, solution_str, ground_truth, extra_info)
     accuracy_reward = 1.0 - accuracy_reward
     return {
         "format_reward": format_reward,
         "accuracy_reward": accuracy_reward,
-        "final_reward": 1 if format_reward * accuracy_reward > 0 else 0
+        # An unverified fixed-label verdict is unknown, never rewarded as wrong.
+        "final_reward": 1 if format_reward * accuracy_reward > 0 and not
+        _fixed_label_scoring_failed(extra_info) else 0
     }
 
 
@@ -172,7 +231,7 @@ def math_incorrect_format_score(data_source, solution_str, ground_truth, extra_i
 
 # reward for rule-base RL training
 _SynLogic_Scores = {
-    "acc_without_think_format": compute_score_wo_think_format,
+    "acc_without_think_format": compute_training_score_wo_think_format,
     "think_format": compute_think_format_score,
     "acc_with_think_format": compute_score_w_think_format_score,
     "random_score_with_format": random_score_with_format,
@@ -246,6 +305,59 @@ def _true_reward_diagnostic(data_source, response_str, extra_info, score_type, s
         return None, False, True
 
 
+def _clean_reference_verdict(data_source, response_str, extra_info, original):
+    """Read-only native verdict against the frozen original reference.
+
+    Uses the unchanged native scorer. The deadline bounds only this diagnostic;
+    a timeout or exception is reported as an error, never as an incorrect answer.
+    """
+    shadow = copy.deepcopy(extra_info)
+    for key in ("verifier_timed_out", "verifier_unverified",
+                "assigned_answer_key", "diagnostic_assigned_answer_key"):
+        shadow.pop(key, None)
+    shadow.update(target_mode="original_verifier", diagnostic_is_noisy=False,
+                  game_data=_preprocess_game_data(original), game_data_str=original)
+    try:
+        with verifier_deadline(), open(os.devnull, "w") as sink, \
+                contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            correct = compute_score_wo_think_format(
+                data_source, response_str, shadow["game_data"].answer, shadow) > 0
+    except (Exception, TaskDeadlineExceeded):
+        return None, False, True
+    return bool(correct), True, False
+
+
+def _frozen_target_diagnostics(data_source, response_str, ground_truth, extra_info):
+    """Per-response noisy-row diagnostics from frozen assigned and original targets."""
+    target_mode = extra_info.get("target_mode")
+    frozen_noisy = bool(extra_info.get("diagnostic_is_noisy", target_mode == "fixed_wrong_answer"))
+    assigned_match, assigned_error = False, False
+    true_correct = verified = error = None
+    if frozen_noisy or target_mode == "fixed_wrong_answer":
+        original = extra_info.get("original_game_data_str")
+        frozen_target = extra_info.get("diagnostic_assigned_answer_key", extra_info.get("assigned_answer_key"))
+        if original is None or (frozen_noisy and frozen_target is None):
+            raise ValueError("Noisy training diagnostics require frozen assigned and original clean targets")
+        extracted = extract_answer(response_str)
+        if extracted is not None and frozen_noisy:
+            try:
+                with verifier_deadline():
+                    assigned_match = answer_key(extracted, verifier_classes[data_source]()) == frozen_target
+            except (Exception, TaskDeadlineExceeded):
+                assigned_error = True
+        true_correct, verified, error = _clean_reference_verdict(data_source, response_str, extra_info, original)
+    return {
+        "diagnostic_effective_target": extra_info.get("assigned_answer_key") if target_mode == "fixed_wrong_answer" else ground_truth,
+        "diagnostic_effective_target_mode": extra_info.get("target_mode", "original_verifier"),
+        "diagnostic_is_noisy": frozen_noisy,
+        "diagnostic_assigned_match": assigned_match,
+        "diagnostic_assigned_error": assigned_error,
+        "diagnostic_true_correct": true_correct,
+        "diagnostic_true_verified": verified,
+        "diagnostic_true_error": error,
+    }
+
+
 class SynLogicRewardManager:
     """The SynLogic reward manager."""
     def __init__(
@@ -311,8 +423,6 @@ class SynLogicRewardManager:
             if extra_info is not None and "game_data_str" in extra_info:
                 extra_info["game_data"] = _preprocess_game_data(extra_info["game_data_str"])
             
-            import copy
-
             scored_info = copy.deepcopy(extra_info)
             result = self.compute_score(
                 data_source=data_source,
@@ -330,15 +440,20 @@ class SynLogicRewardManager:
             else:
                 score = result
                 
-            # Training-only, per-response diagnostic; validation protocol is unchanged.
+            # Training-only, read-only diagnostics; validation protocol is unchanged.
+            # One canonical native clean-reference verdict feeds both the frozen
+            # noisy-row fields and the critic/true_reward fields.
             if (not data_item.non_tensor_batch[self.reward_fn_key].startswith("val/")
                     and self.score_type not in ("validation_acc", "math_validation_acc")):
                 existing = None
-                if all(len(reward_extra_info.get("diagnostic_true_" + field, [])) > i
-                       for field in ("correct", "verified", "error")):
-                    existing = {key: reward_extra_info.get("diagnostic_true_" + field)[i]
-                                for key, field in [("correct", "correct"), ("verified", "verified"),
-                                                   ("error", "error")]}
+                if extra_info is not None and "game_data_str" in extra_info:
+                    frozen = _frozen_target_diagnostics(data_source, response_str, ground_truth, extra_info)
+                    for key, value in frozen.items():
+                        reward_extra_info[key].append(value)
+                    if frozen["diagnostic_true_verified"] is not None:
+                        existing = {"correct": frozen["diagnostic_true_correct"],
+                                    "verified": frozen["diagnostic_true_verified"],
+                                    "error": frozen["diagnostic_true_error"]}
                 true_reward, true_verified, true_error = _true_reward_diagnostic(
                     data_source, response_str, extra_info, self.score_type, score,
                     scored_info, existing)
